@@ -36,6 +36,9 @@ dev = ["pytest", "ruff"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.pytest.ini_options]
+markers = ["integration: live tests that call external APIs (require SO_OPS_OR_API_KEY)"]
+
 [tool.ruff]
 line-length = 100
 
