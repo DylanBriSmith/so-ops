@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from so_ops.config import Config
-from so_ops.clients.ollama import OllamaClient
+from so_ops.clients import make_llm_client
+from so_ops.clients.base import LLMClient
 from so_ops.clients.notify import notify_all
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
@@ -253,7 +254,7 @@ def _build_report(hosts: list, vulns: list, nuclei_findings: list,
     return "\n".join(lines)
 
 
-def _generate_ai_summary(report_text: str, llm: OllamaClient) -> str | None:
+def _generate_ai_summary(report_text: str, llm: LLMClient) -> str | None:
     prompt = f"""You are a security analyst. Below is a vulnerability scan report from a home/small-office network.
 Write a concise executive summary (5-10 bullet points) covering:
 1. Overall risk posture
@@ -286,7 +287,7 @@ def run_vulnscan(cfg: Config, scan_type: str = "all"):
     state = ToolState("vulnscan", state_dir)
     state.start_run()
 
-    llm = OllamaClient(cfg.ollama)
+    llm = make_llm_client(cfg)
     vs = cfg.vulnscan
     targets = vs.targets
 

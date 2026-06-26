@@ -8,10 +8,13 @@ def test_load_example_config(example_config_path):
     cfg = load_config(example_config_path)
     assert isinstance(cfg, Config)
     assert "9200" in cfg.elasticsearch.host
-    assert cfg.elasticsearch.user == "so_elastic"
+    assert cfg.elasticsearch.user == "so_ops"
     assert cfg.elasticsearch.indices.suricata == "logs-suricata.alerts-so"
     assert cfg.elasticsearch.indices.zeek == "logs-zeek-so"
+    assert cfg.ollama is not None
     assert cfg.ollama.model == "qwen3:14b"
+    assert cfg.llm_provider == "ollama"
+    assert cfg.openrouter is None
     assert "email" in cfg.notifications
     assert cfg.notifications["email"]["enabled"] is False
     assert len(cfg.triage.auto_noise.signatures) == 4

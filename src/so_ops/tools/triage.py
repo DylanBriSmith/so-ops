@@ -9,8 +9,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from so_ops.config import Config
+from so_ops.clients import make_llm_client
+from so_ops.clients.base import LLMClient
 from so_ops.clients.elasticsearch import SOElasticClient
-from so_ops.clients.ollama import OllamaClient
 from so_ops.clients.notify import notify_all
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
@@ -156,7 +157,7 @@ def _enforce_minimum_severity(rule_name: str, verdict: str,
     return verdict
 
 
-def _triage_with_llm(alerts: list, llm: OllamaClient, cfg_triage,
+def _triage_with_llm(alerts: list, llm: LLMClient, cfg_triage,
                      zones, log) -> dict:
     """Send alert group to LLM for triage classification."""
     prompt = _build_triage_prompt(alerts, cfg_triage.max_batch_size, zones)
@@ -310,7 +311,7 @@ def run_triage(cfg: Config, dry_run: bool = False):
     state.start_run()
 
     es = SOElasticClient(cfg.elasticsearch)
-    llm = OllamaClient(cfg.ollama)
+    llm = make_llm_client(cfg)
     indices = cfg.elasticsearch.indices
     zones = cfg.network.zones
 

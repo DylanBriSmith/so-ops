@@ -34,6 +34,13 @@ class OllamaConfig:
 
 
 @dataclass
+class OpenRouterConfig:
+    model: str
+    api_key: str = ""
+    base_url: str = "https://openrouter.ai/api/v1"
+
+
+@dataclass
 class PathsConfig:
     data_dir: Path
 
@@ -93,13 +100,15 @@ class NetworkConfig:
 @dataclass
 class Config:
     elasticsearch: ESConfig
-    ollama: OllamaConfig
     paths: PathsConfig
     notifications: dict[str, dict]
     triage: TriageConfig
     health: HealthConfig
     vulnscan: VulnscanConfig
     network: NetworkConfig
+    ollama: OllamaConfig | None = None
+    openrouter: OpenRouterConfig | None = None
+    llm_provider: str = "ollama"
 
 
 def _find_config_file() -> Path:
@@ -148,7 +157,36 @@ def load_config(path: Path | None = None) -> Config:
             es_raw["password"] = env_password
         es = ESConfig(**es_raw, indices=ESIndicesConfig(**indices_raw))
 
-        ollama = OllamaConfig(**raw["ollama"])
+        ollama = OllamaConfig(**raw["ollama"]) if "ollama" in raw else None
+
+        openrouter: OpenRouterConfig | None = None
+        if "openrouter" in raw:
+            or_raw = dict(raw["openrouter"])
+            env_key = os.environ.get("SO_OPS_OR_API_KEY")
+            if env_key:
+                or_raw["api_key"] = env_key
+            openrouter = OpenRouterConfig(**or_raw)
+
+        llm_provider = str(raw.get("llm_provider", "ollama"))
+        if llm_provider not in ("ollama", "openrouter"):
+            print(
+                f"so-ops: unknown llm_provider '{llm_provider}' in {path}; must be 'ollama' or 'openrouter'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if llm_provider == "ollama" and ollama is None:
+            print(
+                f"so-ops: llm_provider = 'ollama' but no [ollama] section in {path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if llm_provider == "openrouter" and openrouter is None:
+            print(
+                f"so-ops: llm_provider = 'openrouter' but no [openrouter] section in {path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         paths = PathsConfig(**raw.get("paths", {"data_dir": "~/so-ops-data"}))
 
         # Notifications: collect all [notifications.*] sections
@@ -191,11 +229,13 @@ def load_config(path: Path | None = None) -> Config:
 
     return Config(
         elasticsearch=es,
-        ollama=ollama,
         paths=paths,
         notifications=notifications,
         triage=triage,
         health=health,
         vulnscan=vulnscan,
         network=network,
+        ollama=ollama,
+        openrouter=openrouter,
+        llm_provider=llm_provider,
     )

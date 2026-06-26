@@ -9,8 +9,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from so_ops.config import Config
+from so_ops.clients import make_llm_client
+from so_ops.clients.base import LLMClient
 from so_ops.clients.elasticsearch import SOElasticClient
-from so_ops.clients.ollama import OllamaClient
 from so_ops.clients.notify import notify_all
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
@@ -397,7 +398,7 @@ def _build_zone_context(zones) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def _generate_llm_briefing(raw_report: str, llm: OllamaClient,
+def _generate_llm_briefing(raw_report: str, llm: LLMClient,
                            temperature: float, zones) -> str:
     zone_context = _build_zone_context(zones)
 
@@ -438,7 +439,7 @@ def run_health(cfg: Config):
     state.start_run()
 
     es = SOElasticClient(cfg.elasticsearch)
-    llm = OllamaClient(cfg.ollama)
+    llm = make_llm_client(cfg)
     indices = cfg.elasticsearch.indices
     internal_prefixes = cfg.network.internal_prefixes
     zones = cfg.network.zones

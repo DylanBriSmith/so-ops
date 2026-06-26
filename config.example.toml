@@ -2,6 +2,9 @@
 # Copy to config.toml and fill in your values, or run: so-ops init
 # chmod 600 config.toml
 
+# LLM backend: "ollama" (default, local) or "openrouter" (cloud)
+llm_provider = "ollama"
+
 [elasticsearch]
 host = "https://<your-so-manager>:9200"
 # Recommended: create a dedicated read-only user instead of using so_elastic
@@ -22,6 +25,15 @@ data_streams = "*so*"
 [ollama]
 url = "http://localhost:11434"
 model = "qwen3:14b"
+
+# ── OpenRouter (cloud LLM alternative) ───────────────────────
+# Set llm_provider = "openrouter" above to use this instead of Ollama.
+# API key can also be set via SO_OPS_OR_API_KEY env var (recommended).
+# Find model IDs at https://openrouter.ai/models
+#
+# [openrouter]
+# model = "anthropic/claude-haiku-4-5"
+# api_key = ""   # or use SO_OPS_OR_API_KEY env var
 
 # ── Notifications ────────────────────────────────────────────
 # Enable one or more providers. Each needs enabled = true.
