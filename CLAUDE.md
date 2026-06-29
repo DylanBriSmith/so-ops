@@ -30,14 +30,14 @@ To run triage manually (env vars must be set each session unless added to PowerS
 ```powershell
 $env:SO_OPS_ES_PASSWORD = '123456'
 $env:SO_OPS_OR_API_KEY  = 'sk-or-v1-...'
-$env:SO_OPS_CONFIG      = 'C:\Users\dnsh\so-ops\config.toml'
+$env:SO_OPS_CONFIG      = 'C:\CBScripts\so-ops\config.toml'
 so-ops triage
 ```
 
 To re-run triage against already-seen alerts (reset the cursor):
 
 ```powershell
-Remove-Item "$env:USERPROFILE\so-ops-data\state\triage.json" -Force
+Remove-Item "C:\CBFiles\so-ops-data\state\triage.json" -Force
 ```
 
 ## Configuration
@@ -93,7 +93,7 @@ ruff format src/ tests/    # format
 
 ## State and logging
 
-Each tool persists a JSON cursor in `data_dir/state/` (configured via `[paths].data_dir`, currently `~/so-ops-data`). The cursor prevents re-processing alerts already seen.
+Each tool persists a JSON cursor in `data_dir/state/` (configured via `[paths].data_dir`, currently `C:/CBFiles/so-ops-data`). The cursor prevents re-processing alerts already seen.
 
 Logs are written to three destinations simultaneously:
 - stderr
