@@ -1,14 +1,17 @@
 [Unit]
 Description=SO Vulnerability Scan (nuclei)
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
+Requires=docker.service
 
 [Service]
 Type=oneshot
-User=om
-ExecStart=/home/om/so-ops/.venv/bin/so-ops scan --type nuclei
-WorkingDirectory=/home/om/so-ops
-Environment=SO_OPS_CONFIG=/home/om/so-ops/config.toml
+User=soops
+WorkingDirectory=/opt/so-ops
+ExecStart=/usr/bin/docker compose run --rm so-ops scan --type nuclei
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target

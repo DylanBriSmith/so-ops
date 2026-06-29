@@ -1,5 +1,5 @@
 [Unit]
-Description=Run SO daily health check at 7:10 AM EST
+Description=Run SO daily health report at 7:10 AM EST
 
 [Timer]
 OnCalendar=*-*-* 12:10:00 UTC
