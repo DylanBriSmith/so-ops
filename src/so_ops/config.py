@@ -187,7 +187,10 @@ def load_config(path: Path | None = None) -> Config:
             )
             sys.exit(1)
 
-        paths = PathsConfig(**raw.get("paths", {"data_dir": "~/so-ops-data"}))
+        paths_raw = dict(raw.get("paths", {"data_dir": "~/so-ops-data"}))
+        if os.environ.get("SO_OPS_DATA_DIR"):
+            paths_raw["data_dir"] = os.environ["SO_OPS_DATA_DIR"]
+        paths = PathsConfig(**paths_raw)
 
         # Notifications: collect all [notifications.*] sections
         notifications: dict[str, dict] = {}

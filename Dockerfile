@@ -11,11 +11,12 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir
 
-# config and state directories
-RUN mkdir -p /root/.config/so-ops /app/state
+# config and data directories
+RUN mkdir -p /root/.config/so-ops /app/data
 
 # Default config path
 ENV SO_OPS_CONFIG=/root/.config/so-ops/config.toml
+ENV SO_OPS_DATA_DIR=/app/data
  
 ENTRYPOINT ["so-ops"]
 CMD ["--help"]
