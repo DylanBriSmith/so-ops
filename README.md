@@ -2,12 +2,12 @@
 
 LLM-powered alert triage, daily health reports, and vulnerability scanning for [Security Onion](https://securityonion.net/).
 
-A free, open-source companion tool that fills gaps in the SO ecosystem: automated alert classification with local LLMs, morning briefing emails, and scheduled nmap/nuclei scanning — all without cloud dependencies.
+A free, open-source companion tool that fills gaps in the SO ecosystem: automated alert classification via local or cloud LLMs, morning briefing emails, and scheduled nmap/nuclei scanning — all with zero third-party Python dependencies.
 
 ## Features
 
 ### Alert Triage (`so-ops triage`)
-Queries Suricata IDS alerts from Elasticsearch, groups them by signature, and uses a local LLM (via Ollama) to classify each group as NOISE / LOW / MEDIUM / HIGH. Known-benign signatures are auto-cleared. HIGH alerts trigger instant notifications.
+Queries Suricata IDS alerts from Elasticsearch, groups them by signature, and uses an LLM to classify each group as NOISE / LOW / MEDIUM / HIGH. Known-benign signatures are auto-cleared. HIGH alerts trigger instant notifications.
 
 ```
 ## Verdict Breakdown
@@ -45,9 +45,9 @@ A small Linux VM, a spare workstation, or even a Raspberry Pi 5 will work — th
 
 | Requirement | Purpose | Notes |
 |-------------|---------|-------|
-| **Security Onion 2.4+** | Data source | Elasticsearch must be enabled |
+| **Security Onion 3.0+** | Data source | Elasticsearch must be enabled |
 | **Python 3.11+** | Runtime | Ships with most modern distros |
-| **Ollama** | Local LLM | Install from [ollama.com](https://ollama.com), then `ollama pull qwen3:14b` |
+| **Ollama** or **OpenRouter** | LLM inference | Ollama runs locally; OpenRouter is a cloud API (requires `SO_OPS_OR_API_KEY`) |
 | **nmap** | Vulnerability scanning | Optional — only for `so-ops scan` |
 | **Docker** | Nuclei scanning | Optional — only for `so-ops scan --type nuclei` |
 
@@ -55,7 +55,32 @@ so-ops has **zero third-party Python dependencies** — it only uses the Python 
 
 ## Install
 
-### Option A — pip install (recommended)
+### Option A — Docker (recommended)
+
+Docker is the easiest way to run so-ops. It bundles Python, nmap, and the Docker CLI in a single image.
+
+```bash
+git clone https://github.com/benolenick/so-ops.git
+cd so-ops
+
+# Copy and edit the example config
+cp config.example.toml config.toml
+
+# Create a .env file for secrets (never commit this)
+cat > .env <<EOF
+SO_OPS_ES_PASSWORD=your_es_password
+SO_OPS_OR_API_KEY=sk-or-v1-...
+EOF
+
+# Build and run
+docker compose run --rm so-ops triage
+docker compose run --rm so-ops health
+docker compose run --rm so-ops scan --type nmap
+```
+
+The `.env` file is loaded automatically by Docker Compose and keeps secrets out of `config.toml`. It is excluded from the Docker image via `.dockerignore` and should be excluded from version control via `.gitignore`.
+
+### Option B — pip install
 
 ```bash
 pip install git+https://github.com/benolenick/so-ops.git
@@ -74,7 +99,7 @@ sudo apt install python3-pip
 python3 -m pip install git+https://github.com/benolenick/so-ops.git
 ```
 
-### Option B — clone and install
+### Option C — clone and install
 
 ```bash
 git clone https://github.com/benolenick/so-ops.git
@@ -92,7 +117,7 @@ The only **essential** credential is your Elasticsearch password. Everything els
 |------|-----------------|-----------|
 | **SO manager IP/hostname** | Your Security Onion manager's address (e.g. `https://10.0.0.50:9200`) | Yes |
 | **Elasticsearch user + password** | A read-only ES account (see [Security](#security) below) | Yes |
-| **Ollama URL** | Defaults to `http://localhost:11434` if Ollama is on the same box as so-ops. If Ollama runs elsewhere, use that machine's IP. | Yes |
+| **LLM provider** | `ollama` (local) or `openrouter` (cloud) — see [LLM Providers](#llm-providers) | Yes |
 | **Notification credentials** | Discord/Slack webhook URL, email SMTP credentials, ntfy topic, etc. | No — but recommended |
 | **Network subnets** | Your monitored CIDRs (e.g. `192.168.1.0/24`). Helps the LLM understand which IPs are internal. | No — but improves triage accuracy |
 
@@ -124,25 +149,57 @@ sudo so-elasticsearch-query _security/user/so_ops -XPUT -d '{
 
 If `so-elasticsearch-query` isn't available on your SO version, you can do the same via Kibana (Stack Management > Security > Roles/Users) or directly with curl against the ES API.
 
-**Keep the password out of the config file:**
+**Keep secrets out of config files:**
 
-so-ops supports the `SO_OPS_ES_PASSWORD` environment variable, which overrides whatever is in `config.toml`. This way you can leave the password field empty in the file:
+so-ops reads credentials from environment variables, which override whatever is in `config.toml`:
+
+| Env var | Overrides |
+|---------|-----------|
+| `SO_OPS_ES_PASSWORD` | `[elasticsearch].password` |
+| `SO_OPS_OR_API_KEY` | `[openrouter].api_key` |
+| `SO_OPS_CONFIG` | Path to config.toml |
+
+Leave the password fields empty in `config.toml` and pass them via env vars or a `.env` file (Docker Compose loads `.env` automatically):
 
 ```toml
 [elasticsearch]
 host = "https://10.0.0.50:9200"
 user = "so_ops"
-password = ""    # set SO_OPS_ES_PASSWORD env var instead
+password = ""    # set SO_OPS_ES_PASSWORD instead
 ```
 
 ```bash
-# Pass it inline
+# Inline
 SO_OPS_ES_PASSWORD="your_password" so-ops triage
 
-# Or export it in your shell / systemd unit
+# Or export in your shell / systemd unit
 export SO_OPS_ES_PASSWORD="your_password"
 so-ops triage
 ```
+
+### LLM Providers
+
+Two providers are supported, selected via `llm_provider` in `config.toml`:
+
+**Ollama (local)** — no data leaves your network:
+```toml
+llm_provider = "ollama"
+
+[ollama]
+url = "http://localhost:11434"
+model = "qwen3:14b"
+```
+Install from [ollama.com](https://ollama.com), then `ollama pull qwen3:14b`.
+
+**OpenRouter (cloud)** — no local GPU required:
+```toml
+llm_provider = "openrouter"
+
+[openrouter]
+model = "anthropic/claude-haiku-4-5"
+# api_key = ""  # set SO_OPS_OR_API_KEY env var instead
+```
+Get an API key at [openrouter.ai](https://openrouter.ai). Set `SO_OPS_OR_API_KEY` as an env var or in your `.env` file.
 
 ### Running the setup wizard
 
@@ -153,7 +210,7 @@ so-ops init
 The wizard will:
 1. Ask for your SO manager URL and ES credentials, then **test the connection**
 2. Auto-discover your SO data stream indices
-3. Ask for your Ollama URL, then **test the connection** and list available models
+3. Ask for your LLM provider and settings, then **test the connection**
 4. Walk through notification providers (all optional)
 5. Ask for your network zones and scan targets
 6. Write `config.toml` (permissions set to 600)
@@ -166,7 +223,7 @@ cp config.example.toml config.toml
 chmod 600 config.toml
 # Edit config.toml — at minimum fill in:
 #   [elasticsearch] host, user, password
-#   [ollama] url, model
+#   [ollama] or [openrouter] section
 ```
 
 ### Verify and run
@@ -188,7 +245,8 @@ Configuration lives in `config.toml` (searched in CWD, then `~/.config/so-ops/`,
 |---------|---------|
 | `[elasticsearch]` | SO manager connection + index names |
 | `[ollama]` | Local LLM endpoint + model |
-| `[notifications.*]` | Email, Discord, Slack, ntfy, Gotify, SMS, webhook |
+| `[openrouter]` | Cloud LLM via OpenRouter API |
+| `[notifications.*]` | Email, Discord, Slack, Teams, ntfy, Gotify, SMS, webhook |
 | `[network.zones]` | Your subnet layout (helps LLM classify alerts) |
 | `[triage]` | Lookback window, auto-noise signatures, escalation rules |
 | `[vulnscan]` | Scan targets, nmap/nuclei options |
@@ -202,6 +260,7 @@ so-ops supports multiple notification providers simultaneously. Enable any combi
 - **Email** — SMTP SSL
 - **Discord** — Webhook
 - **Slack** — Webhook
+- **Teams** — Microsoft Teams via Power Automate HTTP webhook (Adaptive Cards)
 - **ntfy** — Push notifications (self-hosted or ntfy.sh)
 - **Gotify** — Self-hosted push
 - **SMS** — Twilio
@@ -219,7 +278,7 @@ so-ops supports multiple notification providers simultaneously. Enable any combi
 ## How It Works
 
 1. **Elasticsearch queries** use the standard Security Onion index patterns (`logs-suricata.alerts-so`, `logs-zeek-so`, etc.) which are consistent across all SO installs
-2. **LLM classification** runs locally via Ollama — no data leaves your network
+2. **LLM classification** runs via Ollama (local, no data leaves your network) or OpenRouter (cloud, no local GPU needed)
 3. **Network zone context** from your config is injected into LLM prompts so it understands which IPs are internal vs. external
 4. **State tracking** via JSON files prevents re-processing alerts and tracks run history
 
