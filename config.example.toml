@@ -1,42 +1,78 @@
-# so-ops configuration
-# Copy to config.toml and fill in your values, or run: so-ops init
-# chmod 600 config.toml
+# so-ops configuration example — Canadian Bearings
+# Copy to config.toml and fill in your values:
+#   cp config.example.toml config.toml
+#   chmod 600 config.toml          # Linux/Docker
+#
+# Secrets (passwords, API keys) should NOT go in config.toml.
+# Put them in a .env file (loaded automatically by Docker Compose)
+# or export them as environment variables before running.
+#
+# Required env vars:
+#   SO_OPS_ES_PASSWORD   — Elasticsearch password
+#   SO_OPS_OR_API_KEY    — OpenRouter API key (if using openrouter)
 
-# LLM backend: "ollama" (default, local) or "openrouter" (cloud)
-llm_provider = "ollama"
+# LLM backend: "openrouter" (cloud, no GPU needed) or "ollama" (local)
+llm_provider = "openrouter"
+
+# ── Elasticsearch ────────────────────────────────────────────────────────────
+# Security Onion manager at Canadian Bearings.
+# The soc_viewer account is a read-only SO web UI account.
+# Firewall rule must be applied on the SO manager before this will connect:
+#   sudo so-firewall includehost elasticsearch_rest <this-machine-ip>
+#   sudo so-firewall apply
 
 [elasticsearch]
-host = "https://<your-so-manager>:9200"
-# Recommended: create a dedicated read-only user instead of using so_elastic
-# See README.md for instructions on creating an so_ops reader account
-user = "so_ops"
-# Password can also be set via SO_OPS_ES_PASSWORD env var (recommended)
-# If the env var is set, it overrides this value
-password = ""
-verify_ssl = false
+host = "https://<so-manager-ip>:9200"
+user = "soc_viewer"
+password = ""          # set SO_OPS_ES_PASSWORD env var / .env
+verify_ssl = false     # SO uses self-signed certs
 
 [elasticsearch.indices]
-suricata = "logs-suricata.alerts-so"
-zeek = "logs-zeek-so"
+suricata   = "logs-suricata.alerts-so"
+zeek       = "logs-zeek-so"
 detections = "logs-detections.alerts-so"
-syslog = "logs-syslog-so"
+syslog     = "logs-syslog-so"
 data_streams = "*so*"
 
-[ollama]
-url = "http://localhost:11434"
-model = "qwen3:14b"
+# ── LLM: OpenRouter (cloud) ──────────────────────────────────────────────────
+# Get an API key at https://openrouter.ai
+# Set SO_OPS_OR_API_KEY in your .env file — do not paste the key here.
+# Model options (cheapest → most capable):
+#   anthropic/claude-haiku-4-5      fast, cheap, good for triage
+#   anthropic/claude-sonnet-4-5     better reasoning, higher cost
+#   openai/gpt-4o-mini              OpenAI alternative
 
-# ── OpenRouter (cloud LLM alternative) ───────────────────────
-# Set llm_provider = "openrouter" above to use this instead of Ollama.
-# API key can also be set via SO_OPS_OR_API_KEY env var (recommended).
-# Find model IDs at https://openrouter.ai/models
-#
-# [openrouter]
-# model = "anthropic/claude-haiku-4-5"
-# api_key = ""   # or use SO_OPS_OR_API_KEY env var
+[openrouter]
+model = "anthropic/claude-haiku-4-5"
+api_key = ""           # set SO_OPS_OR_API_KEY env var / .env
 
-# ── Notifications ────────────────────────────────────────────
-# Enable one or more providers. Each needs enabled = true.
+# ── LLM: Ollama (local, no API key needed) ───────────────────────────────────
+# Uncomment and set llm_provider = "ollama" above to use local inference.
+# Install Ollama from https://ollama.com, then: ollama pull qwen3:14b
+
+# [ollama]
+# url = "http://localhost:11434"
+# model = "qwen3:14b"
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+
+[paths]
+data_dir = "~/so-ops-data"
+
+# ── Notifications ────────────────────────────────────────────────────────────
+# Enable one or more providers. Test with: so-ops test-notify
+# Teams is the primary channel — test carefully before enabling on a schedule,
+# the webhook posts to a live shared channel.
+
+[notifications.teams]
+enabled = false
+# Power Automate HTTP webhook URL — paste your webhook URL here
+url = ""
+
+[notifications.ntfy]
+enabled = false
+url = "https://ntfy.sh"
+topic = "so-ops-alerts"
 
 [notifications.email]
 enabled = false
@@ -54,11 +90,6 @@ webhook_url = ""
 enabled = false
 webhook_url = ""
 
-[notifications.ntfy]
-enabled = false
-url = "https://ntfy.sh"
-topic = ""
-
 [notifications.gotify]
 enabled = false
 url = ""
@@ -75,20 +106,17 @@ to_number = ""
 enabled = false
 url = ""
 
-# ── Paths ────────────────────────────────────────────────────
-
-[paths]
-data_dir = "~/so-ops-data"
-
-# ── Triage ───────────────────────────────────────────────────
+# ── Triage ───────────────────────────────────────────────────────────────────
 
 [triage]
-lookback_hours = 24
-max_alerts_per_run = 500
-max_alerts_per_query = 2000
-max_batch_size = 50
-llm_temperature = 0.1
+lookback_hours = 24           # how far back each run queries
+max_alerts_per_run = 500      # max alert groups sent to LLM per run
+max_alerts_per_query = 2000   # ES query result cap
+max_batch_size = 50           # alerts per LLM batch call
+llm_temperature = 0.1         # low = deterministic classification
 
+# Signatures skipped entirely (no LLM call, auto-classified as NOISE).
+# Add any signatures that are confirmed benign in your environment.
 [triage.auto_noise]
 signatures = [
     "ET INFO Session Traversal Utilities for NAT (STUN Binding Request)",
@@ -97,6 +125,7 @@ signatures = [
     "ET INFO Microsoft Connection Test",
 ]
 
+# Signature prefixes that force a minimum severity regardless of LLM verdict.
 [triage.escalation]
 minimum_medium = [
     "ET SCAN", "ET EXPLOIT", "ET TROJAN", "ET MALWARE", "ET ATTACK",
@@ -108,31 +137,45 @@ minimum_high = [
     "ET SHELLCODE", "GPL EXPLOIT",
 ]
 
-# ── Health ───────────────────────────────────────────────────
+# ── Health ───────────────────────────────────────────────────────────────────
 
 [health]
 llm_temperature = 0.3
 
-# ── Vulnerability Scanning ───────────────────────────────────
+# ── Vulnerability Scanning ───────────────────────────────────────────────────
+# Adjust targets to match your actual network ranges.
+# nmap runs inside the Docker container, which has network access to these ranges.
 
 [vulnscan]
-targets = ["192.168.0.0/24"]
+targets = [
+    "192.168.0.0/24",    # example: server VLAN
+    "192.168.1.0/24",    # example: workstation VLAN
+]
 nmap_bin = "/usr/bin/nmap"
 nmap_args = "-sV --script=vulners -T4 --open"
 nuclei_docker = "projectdiscovery/nuclei:latest"
 nuclei_severity = "medium,high,critical"
 
-# ── Network ──────────────────────────────────────────────────
+# ── Network zones ─────────────────────────────────────────────────────────────
+# Used by the LLM to understand which IPs are internal vs external.
+# Add a [[network.zones]] block for each subnet in your environment.
+# More zones = better triage accuracy.
 
 [network]
 internal_prefixes = ["192.168.", "10.", "172.16."]
 
 [[network.zones]]
 cidr = "192.168.0.0/24"
-name = "server LAN"
-description = "Security Onion manager, servers"
+name = "Server VLAN"
+description = "Security Onion manager, servers, infrastructure"
 
 [[network.zones]]
 cidr = "192.168.1.0/24"
-name = "client LAN"
-description = "Workstations, phones, IoT"
+name = "Workstation VLAN"
+description = "User workstations, laptops, printers"
+
+# Add more zones as needed:
+# [[network.zones]]
+# cidr = "10.0.0.0/24"
+# name = "DMZ"
+# description = "Public-facing servers"
