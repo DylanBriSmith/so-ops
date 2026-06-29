@@ -88,8 +88,54 @@ def _build_zone_context(zones) -> str:
     return "\n".join(lines)
 
 
-def _build_triage_prompt(alerts: list, max_batch: int, zones) -> str:
-    """Build an LLM prompt for triaging a group of similar alerts."""
+def _scrub_ips(alerts: list, internal_prefixes: list[str]) -> tuple[list, dict]:
+    """Replace real IPs with anonymized tokens. Returns scrubbed alerts and the mapping."""
+    mapping: dict[str, str] = {}
+    int_counter, ext_counter = 0, 0
+
+    def token(ip: str) -> str:
+        nonlocal int_counter, ext_counter
+        if ip in mapping:
+            return mapping[ip]
+        if any(ip.startswith(p) for p in internal_prefixes):
+            int_counter += 1
+            tok = f"INT-{int_counter:03d}"
+        else:
+            ext_counter += 1
+            tok = f"EXT-{ext_counter:03d}"
+        mapping[ip] = tok
+        return tok
+
+    scrubbed = []
+    for a in alerts:
+        s = dict(a)
+        s["source_ip"] = (
+            token(a["source_ip"])
+            if a.get("source_ip") and a["source_ip"] != "?"
+            else a["source_ip"]
+        )
+        s["dest_ip"] = (
+            token(a["dest_ip"]) if a.get("dest_ip") and a["dest_ip"] != "?" else a["dest_ip"]
+        )
+        scrubbed.append(s)
+
+    return scrubbed, {v: k for k, v in mapping.items()}
+
+
+def _build_triage_prompt(
+    alerts: list,
+    max_batch: int,
+    zones,
+    scrub_ips: bool = True,
+    internal_prefixes: list[str] | None = None,
+) -> tuple[str, dict]:
+    """Build an LLM prompt for triaging a group of similar alerts.
+    Returns (prompt, ip_map) where ip_map is token->real_ip (empty if not scrubbing)."""
+    ip_map: dict[str, str] = {}
+
+    if scrub_ips and internal_prefixes:
+        alerts, ip_map = _scrub_ips(alerts, internal_prefixes)
+
     rule_name = alerts[0]["rule_name"]
     source_ip = alerts[0]["source_ip"]
 
@@ -102,13 +148,18 @@ def _build_triage_prompt(alerts: list, max_batch: int, zones) -> str:
     sample = alerts[0]
 
     zone_context = _build_zone_context(zones)
+    ip_legend = (
+        "\n- INT-* = internal network addresses, EXT-* = external/internet addresses"
+        if scrub_ips and internal_prefixes
+        else ""
+    )
 
-    return f"""You are a Security Operations Center analyst triaging IDS alerts from a home/small business network.
+    prompt = f"""You are a Security Operations Center analyst triaging IDS alerts from a home/small business network.
 
 Network context:
 {zone_context}
 - External IPs = internet traffic
-- This is a home lab / small business, not an enterprise
+- This is a home lab / small business, not an enterprise{ip_legend}
 
 Alert group to triage:
 - Rule: {rule_name}
@@ -138,6 +189,7 @@ Important classification guidelines:
 Respond in this exact JSON format (no other text):
 {{"verdict": "NOISE|LOW|MEDIUM|HIGH", "reason": "Brief explanation (1-2 sentences)", "recommendation": "What to do about it (1 sentence)"}}
 """
+    return prompt, ip_map
 
 
 def _enforce_minimum_severity(
@@ -165,9 +217,16 @@ def _triage_with_llm(
     zones,
     log,
     llm_log_path: Path | None = None,
+    internal_prefixes: list[str] | None = None,
 ) -> dict:
     """Send alert group to LLM for triage classification."""
-    prompt = _build_triage_prompt(alerts, cfg_triage.max_batch_size, zones)
+    prompt, ip_map = _build_triage_prompt(
+        alerts,
+        cfg_triage.max_batch_size,
+        zones,
+        scrub_ips=cfg_triage.scrub_ips,
+        internal_prefixes=internal_prefixes,
+    )
     raw_response = None
     verdict_info = {
         "verdict": "LOW",
@@ -210,6 +269,8 @@ def _triage_with_llm(
             "rule_name": alerts[0]["rule_name"],
             "source_ip": alerts[0]["source_ip"],
             "alert_count": len(alerts),
+            "scrub_ips": cfg_triage.scrub_ips,
+            "ip_map": ip_map,
             "prompt_chars": len(prompt),
             "prompt": prompt,
             "raw_response": raw_response,
@@ -418,7 +479,13 @@ def run_triage(cfg: Config, dry_run: bool = False):
                 )
 
                 verdict_info = _triage_with_llm(
-                    group_alerts_list, llm, cfg.triage, zones, log, llm_log_path
+                    group_alerts_list,
+                    llm,
+                    cfg.triage,
+                    zones,
+                    log,
+                    llm_log_path,
+                    internal_prefixes=cfg.network.internal_prefixes,
                 )
                 verdict_info["method"] = "llm"
                 log.info("    -> %s: %s", verdict_info["verdict"], verdict_info["reason"][:80])

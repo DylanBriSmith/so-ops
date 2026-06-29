@@ -66,6 +66,7 @@ class TriageConfig:
     max_alerts_per_query: int = 2000
     max_batch_size: int = 50
     llm_temperature: float = 0.1
+    scrub_ips: bool = True
     auto_noise: TriageAutoNoise = field(default_factory=TriageAutoNoise)
     escalation: TriageEscalation = field(default_factory=TriageEscalation)
 
