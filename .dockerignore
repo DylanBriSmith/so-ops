@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+.venv
+venv
+.env
+.git
+.claude
+*.md
+!README.md
+tests/
+scripts/
+systemd/

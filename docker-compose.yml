@@ -1,0 +1,23 @@
+services:
+  so-ops:
+    build: .
+    image: so-ops:latest
+    volumes:
+      # Your config file (create from config.example.toml)
+      - ./config.toml:/root/.config/so-ops/config.toml:ro
+      # Persist state (run history, processed alerts) across restarts
+      - so-ops-state:/app/state
+      # Docker socket — required for nuclei scans (`so-ops scan --type nuclei`)
+      # Remove this line if you don't use nuclei scanning
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Pass secrets via env vars instead of putting them in config.toml
+      - SO_OPS_ES_PASSWORD=${SO_OPS_ES_PASSWORD}
+      - SO_OPS_OR_API_KEY=${SO_OPS_OR_API_KEY:-}
+    # Override CMD to run a specific command, e.g.:
+    #   docker compose run --rm so-ops triage
+    #   docker compose run --rm so-ops health
+    #   docker compose run --rm so-ops scan --type nmap
+
+volumes:
+  so-ops-state:
