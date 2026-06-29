@@ -309,11 +309,16 @@ def _log_triage_result(alert: dict, verdict_info: dict, jsonl_path: Path) -> dic
 
 
 def _generate_summary(
-    results: list, detection_alerts: list, run_time: float, summary_dir: Path
+    results: list,
+    detection_alerts: list,
+    run_time: float,
+    summary_dir: Path,
+    dry_run: bool = False,
 ) -> tuple[Path, str]:
     """Generate a human-readable triage summary markdown."""
     now = datetime.now(timezone.utc)
-    summary_file = summary_dir / f"triage_{now.strftime('%Y%m%d_%H%M%S')}.md"
+    prefix = "dryrun_" if dry_run else "triage_"
+    summary_file = summary_dir / f"{prefix}{now.strftime('%Y%m%d_%H%M%S')}.md"
 
     verdict_counts: dict[str, int] = defaultdict(int)
     verdict_groups: dict[str, list] = defaultdict(list)
@@ -322,12 +327,22 @@ def _generate_summary(
         verdict_counts[v] += 1
         verdict_groups[v].append(r)
 
+    title = (
+        "# SO Alert Triage DRY RUN (rule-based, no LLM)" if dry_run else "# SO Alert Triage Summary"
+    )
     lines = [
-        "# SO Alert Triage Summary",
+        title,
         f"**Generated:** {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"**Processing time:** {run_time:.1f}s",
         f"**Alerts processed:** {len(results)}",
-        "",
+        *(
+            [
+                "**Note:** Verdicts based on Suricata severity + escalation rules only — LLM not called",
+                "",
+            ]
+            if dry_run
+            else [""]
+        ),
         "## Verdict Breakdown",
     ]
     for v in ("HIGH", "MEDIUM", "LOW", "NOISE"):
@@ -497,11 +512,57 @@ def run_triage(cfg: Config, dry_run: bool = False):
                     entry = _log_triage_result(alert, verdict_info, jsonl_path)
                     all_results.append(entry)
         elif needs_review and dry_run:
-            log.info("DRY RUN: skipping LLM triage for %d alerts", len(needs_review))
+            groups = _group_alerts(needs_review)
+            log.info(
+                "DRY RUN: rule-based classification for %d groups (%d alerts)",
+                len(groups),
+                len(needs_review),
+            )
+            sev_map = {1: "HIGH", 2: "MEDIUM", 3: "LOW"}
+            for group_alerts_list in groups.values():
+                rule_name = group_alerts_list[0]["rule_name"]
+                raw_sev = group_alerts_list[0].get("rule_severity", "?")
+                try:
+                    base_verdict = sev_map.get(int(raw_sev), "LOW")
+                except (ValueError, TypeError):
+                    base_verdict = "LOW"
 
-        # Update cursor
-        since = hits[-1]["_source"]["@timestamp"]
-        state.set_cursor("last_timestamp", since)
+                verdict = _enforce_minimum_severity(
+                    rule_name,
+                    base_verdict,
+                    cfg.triage.escalation.minimum_medium,
+                    cfg.triage.escalation.minimum_high,
+                )
+
+                if verdict != base_verdict:
+                    reason = (
+                        f"Suricata severity {raw_sev} ({base_verdict}) "
+                        f"escalated to {verdict} by rule pattern"
+                    )
+                    method = "rule-escalated"
+                elif base_verdict in ("HIGH", "MEDIUM"):
+                    reason = f"Suricata severity {raw_sev} — would need LLM to confirm"
+                    method = "rule-severity"
+                else:
+                    reason = f"Suricata severity {raw_sev} — would need LLM to confirm or downgrade to NOISE"
+                    method = "needs-llm"
+
+                verdict_info = {
+                    "verdict": verdict,
+                    "reason": reason,
+                    "recommendation": "Dry run — no action taken",
+                    "method": method,
+                }
+                for alert in group_alerts_list:
+                    entry = _log_triage_result(alert, verdict_info, jsonl_path)
+                    all_results.append(entry)
+
+        # Update cursor only on live runs so dry run can be repeated
+        if not dry_run:
+            since = hits[-1]["_source"]["@timestamp"]
+            state.set_cursor("last_timestamp", since)
+        else:
+            since = hits[-1]["_source"]["@timestamp"]
 
         if len(hits) < cfg.triage.max_alerts_per_query:
             break
@@ -510,11 +571,14 @@ def run_triage(cfg: Config, dry_run: bool = False):
         log.info("No new alerts to process.")
         run_time = time.time() - start_time
         state.finish_run(alerts=0)
+        if dry_run:
+            print("\nDRY RUN: no alerts found — try resetting the cursor first:")
+            print("  Remove-Item C:\\CBFiles\\so-ops-data\\state\\triage.json -Force")
         return
 
     run_time = time.time() - start_time
     summary_file, summary_text = _generate_summary(
-        all_results, all_detection_alerts, run_time, summary_dir
+        all_results, all_detection_alerts, run_time, summary_dir, dry_run=dry_run
     )
     log.info("Processed %d alerts in %.1fs", len(all_results), run_time)
     log.info("Summary: %s", summary_file)
