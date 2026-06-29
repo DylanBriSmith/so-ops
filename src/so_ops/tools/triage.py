@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from so_ops.config import Config
 from so_ops.clients import make_llm_client
 from so_ops.clients.base import LLMClient
 from so_ops.clients.elasticsearch import SOElasticClient
 from so_ops.clients.notify import notify_all
+from so_ops.config import Config
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
 
@@ -112,15 +112,15 @@ Network context:
 
 Alert group to triage:
 - Rule: {rule_name}
-- Ruleset: {sample['ruleset']}
-- Signature severity: {sample['sig_severity']}
-- Rule severity: {sample['rule_severity']}
-- Category: {sample['category']}
+- Ruleset: {sample["ruleset"]}
+- Signature severity: {sample["sig_severity"]}
+- Rule severity: {sample["rule_severity"]}
+- Category: {sample["category"]}
 - Source IP: {source_ip}
-- Destinations: {', '.join(list(dests)[:10])}
+- Destinations: {", ".join(list(dests)[:10])}
 - Alert count: {len(alerts)}
 - Time range: {time_range}
-- Action: {sample['action']}
+- Action: {sample["action"]}
 
 Classify this alert group into ONE of these categories:
 - NOISE: Expected/benign traffic for this network type. No action needed.
@@ -140,8 +140,9 @@ Respond in this exact JSON format (no other text):
 """
 
 
-def _enforce_minimum_severity(rule_name: str, verdict: str,
-                              min_medium: list[str], min_high: list[str]) -> str:
+def _enforce_minimum_severity(
+    rule_name: str, verdict: str, min_medium: list[str], min_high: list[str]
+) -> str:
     """Enforce minimum severity based on rule name patterns."""
     severity_order = {"NOISE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
     current = severity_order.get(verdict, 1)
@@ -157,16 +158,28 @@ def _enforce_minimum_severity(rule_name: str, verdict: str,
     return verdict
 
 
-def _triage_with_llm(alerts: list, llm: LLMClient, cfg_triage,
-                     zones, log) -> dict:
+def _triage_with_llm(
+    alerts: list,
+    llm: LLMClient,
+    cfg_triage,
+    zones,
+    log,
+    llm_log_path: Path | None = None,
+) -> dict:
     """Send alert group to LLM for triage classification."""
     prompt = _build_triage_prompt(alerts, cfg_triage.max_batch_size, zones)
+    raw_response = None
+    verdict_info = {
+        "verdict": "LOW",
+        "reason": "LLM classification failed, defaulting to LOW",
+        "recommendation": "Manual review recommended",
+    }
     try:
-        response = llm.generate(prompt, temperature=cfg_triage.llm_temperature)
-        start = response.find("{")
-        end = response.rfind("}") + 1
+        raw_response = llm.generate(prompt, temperature=cfg_triage.llm_temperature)
+        start = raw_response.find("{")
+        end = raw_response.rfind("}") + 1
         if start >= 0 and end > start:
-            result = json.loads(response[start:end])
+            result = json.loads(raw_response[start:end])
             verdict = result.get("verdict", "LOW").upper()
             if verdict not in ("NOISE", "LOW", "MEDIUM", "HIGH"):
                 verdict = "LOW"
@@ -174,7 +187,8 @@ def _triage_with_llm(alerts: list, llm: LLMClient, cfg_triage,
             rule_name = alerts[0]["rule_name"]
             original_verdict = verdict
             verdict = _enforce_minimum_severity(
-                rule_name, verdict,
+                rule_name,
+                verdict,
                 cfg_triage.escalation.minimum_medium,
                 cfg_triage.escalation.minimum_high,
             )
@@ -182,7 +196,7 @@ def _triage_with_llm(alerts: list, llm: LLMClient, cfg_triage,
             if verdict != original_verdict:
                 reason += f" [Escalated from {original_verdict} due to rule pattern]"
 
-            return {
+            verdict_info = {
                 "verdict": verdict,
                 "reason": reason,
                 "recommendation": result.get("recommendation", ""),
@@ -190,11 +204,22 @@ def _triage_with_llm(alerts: list, llm: LLMClient, cfg_triage,
     except Exception as exc:
         log.warning("LLM triage failed for %s: %s", alerts[0]["rule_name"], exc)
 
-    return {
-        "verdict": "LOW",
-        "reason": "LLM classification failed, defaulting to LOW",
-        "recommendation": "Manual review recommended",
-    }
+    if llm_log_path is not None:
+        entry = {
+            "called_at": datetime.now(timezone.utc).isoformat(),
+            "rule_name": alerts[0]["rule_name"],
+            "source_ip": alerts[0]["source_ip"],
+            "alert_count": len(alerts),
+            "prompt_chars": len(prompt),
+            "prompt": prompt,
+            "raw_response": raw_response,
+            "verdict": verdict_info["verdict"],
+            "reason": verdict_info["reason"],
+        }
+        with open(llm_log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    return verdict_info
 
 
 def _log_triage_result(alert: dict, verdict_info: dict, jsonl_path: Path) -> dict:
@@ -219,8 +244,9 @@ def _log_triage_result(alert: dict, verdict_info: dict, jsonl_path: Path) -> dic
     return entry
 
 
-def _generate_summary(results: list, detection_alerts: list,
-                      run_time: float, summary_dir: Path) -> tuple[Path, str]:
+def _generate_summary(
+    results: list, detection_alerts: list, run_time: float, summary_dir: Path
+) -> tuple[Path, str]:
     """Generate a human-readable triage summary markdown."""
     now = datetime.now(timezone.utc)
     summary_file = summary_dir / f"triage_{now.strftime('%Y%m%d_%H%M%S')}.md"
@@ -250,7 +276,9 @@ def _generate_summary(results: list, detection_alerts: list,
     if verdict_groups.get("HIGH"):
         lines.append("## HIGH Priority - Investigate Immediately")
         for r in verdict_groups["HIGH"]:
-            lines.append(f"- **{r['rule_name']}** | {r['source_ip']} -> {r['dest_ip']}:{r['dest_port']}")
+            lines.append(
+                f"- **{r['rule_name']}** | {r['source_ip']} -> {r['dest_ip']}:{r['dest_port']}"
+            )
             lines.append(f"  - Reason: {r['reason']}")
             lines.append(f"  - Action: {r['recommendation']}")
         lines.append("")
@@ -258,7 +286,9 @@ def _generate_summary(results: list, detection_alerts: list,
     if verdict_groups.get("MEDIUM"):
         lines.append("## MEDIUM Priority - Investigate When Convenient")
         for r in verdict_groups["MEDIUM"]:
-            lines.append(f"- **{r['rule_name']}** | {r['source_ip']} -> {r['dest_ip']}:{r['dest_port']}")
+            lines.append(
+                f"- **{r['rule_name']}** | {r['source_ip']} -> {r['dest_ip']}:{r['dest_port']}"
+            )
             lines.append(f"  - Reason: {r['reason']}")
             lines.append(f"  - Action: {r['recommendation']}")
         lines.append("")
@@ -288,7 +318,9 @@ def _generate_summary(results: list, detection_alerts: list,
         for da in detection_alerts:
             src = da["_source"]
             rule = src.get("rule", {})
-            lines.append(f"- **{rule.get('name', 'Unknown')}** (severity: {src.get('sigma_level', '?')})")
+            lines.append(
+                f"- **{rule.get('name', 'Unknown')}** (severity: {src.get('sigma_level', '?')})"
+            )
             lines.append(f"  - Time: {src.get('@timestamp', '?')}")
         lines.append("")
 
@@ -305,6 +337,7 @@ def run_triage(cfg: Config, dry_run: bool = False):
     state_dir = data_dir / "state"
     summary_dir = data_dir / "output" / "triage" / "summaries"
     jsonl_path = log_dir / "triage.jsonl"
+    llm_log_path = log_dir / "llm_calls.jsonl"
 
     log = setup_logging("triage", log_dir)
     state = ToolState("triage", state_dir)
@@ -319,7 +352,9 @@ def run_triage(cfg: Config, dry_run: bool = False):
     start_time = time.time()
 
     # Determine starting point
-    default_since = (datetime.now(timezone.utc) - timedelta(hours=cfg.triage.lookback_hours)).isoformat()
+    default_since = (
+        datetime.now(timezone.utc) - timedelta(hours=cfg.triage.lookback_hours)
+    ).isoformat()
     since = state.get_cursor("last_timestamp", default_since)
     log.info("=" * 60)
     log.info("SO Alert Triage starting (dry_run=%s)", dry_run)
@@ -349,16 +384,22 @@ def run_triage(cfg: Config, dry_run: bool = False):
 
         alerts = [_extract_alert_summary(hit) for hit in hits]
         auto_noise, needs_review = _classify_auto_noise(alerts, noise_sigs)
-        log.info("Auto-classified %d as NOISE, %d need LLM review", len(auto_noise), len(needs_review))
+        log.info(
+            "Auto-classified %d as NOISE, %d need LLM review", len(auto_noise), len(needs_review)
+        )
 
         # Log auto-noise results
         for alert in auto_noise:
-            entry = _log_triage_result(alert, {
-                "verdict": "NOISE",
-                "reason": alert["triage_reason"],
-                "recommendation": "No action needed",
-                "method": "auto",
-            }, jsonl_path)
+            entry = _log_triage_result(
+                alert,
+                {
+                    "verdict": "NOISE",
+                    "reason": alert["triage_reason"],
+                    "recommendation": "No action needed",
+                    "method": "auto",
+                },
+                jsonl_path,
+            )
             all_results.append(entry)
 
         # Group remaining alerts for LLM triage
@@ -368,10 +409,17 @@ def run_triage(cfg: Config, dry_run: bool = False):
 
             for i, (group_key, group_alerts_list) in enumerate(groups.items()):
                 rule_name = group_alerts_list[0]["rule_name"]
-                log.info("  [%d/%d] Triaging: %s (%d alerts)",
-                         i + 1, len(groups), rule_name, len(group_alerts_list))
+                log.info(
+                    "  [%d/%d] Triaging: %s (%d alerts)",
+                    i + 1,
+                    len(groups),
+                    rule_name,
+                    len(group_alerts_list),
+                )
 
-                verdict_info = _triage_with_llm(group_alerts_list, llm, cfg.triage, zones, log)
+                verdict_info = _triage_with_llm(
+                    group_alerts_list, llm, cfg.triage, zones, log, llm_log_path
+                )
                 verdict_info["method"] = "llm"
                 log.info("    -> %s: %s", verdict_info["verdict"], verdict_info["reason"][:80])
 
@@ -403,6 +451,32 @@ def run_triage(cfg: Config, dry_run: bool = False):
 
     high_count = sum(1 for r in all_results if r["verdict"] == "HIGH")
 
+    notify_log_path = log_dir / "notifications.jsonl"
+
+    def _log_notification(subject: str, alerts_sent: list, providers: dict[str, bool]):
+        """Append a structured record of a dispatched notification."""
+        entry = {
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "subject": subject,
+            "alert_count": len(alerts_sent),
+            "alerts": [
+                {
+                    "rule_name": a.get(
+                        "rule_name", a.get("_source", {}).get("rule", {}).get("name", "?")
+                    ),
+                    "source_ip": a.get("source_ip", "?"),
+                    "dest_ip": a.get("dest_ip", "?"),
+                    "dest_port": a.get("dest_port", "?"),
+                    "verdict": a.get("verdict", "?"),
+                    "reason": a.get("reason", ""),
+                }
+                for a in alerts_sent
+            ],
+            "providers": providers,
+        }
+        with open(notify_log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
     # Send notifications for HIGH severity alerts
     if not dry_run:
         high_alerts = [r for r in all_results if r["verdict"] == "HIGH"]
@@ -425,17 +499,22 @@ def run_triage(cfg: Config, dry_run: bool = False):
                     sms_lines.append(f"  {a['source_ip']} -> {a['dest_ip']}")
                     seen_rules.add(a["rule_name"])
 
-            notify_all(
+            subject = f"[SO ALERT] HIGH severity - {high_alerts[0]['rule_name']}"
+            providers = notify_all(
                 cfg.notifications,
-                f"[SO ALERT] HIGH severity - {high_alerts[0]['rule_name']}",
+                subject,
                 "\n".join(alert_lines),
                 short="\n".join(sms_lines),
             )
+            _log_notification(subject, high_alerts, providers)
 
         # Notify for high-severity Sigma detections
         if all_detection_alerts:
-            high_sigma = [d for d in all_detection_alerts
-                          if d["_source"].get("sigma_level") in ("high", "critical")]
+            high_sigma = [
+                d
+                for d in all_detection_alerts
+                if d["_source"].get("sigma_level") in ("high", "critical")
+            ]
             if high_sigma:
                 log.info("Sigma detections (%d) — sending notifications...", len(high_sigma))
                 det_rules: dict[str, int] = defaultdict(int)
@@ -445,11 +524,13 @@ def run_triage(cfg: Config, dry_run: bool = False):
                 det_lines = [f"SO SIGMA: {len(high_sigma)} detection(s)"]
                 for rule, count in sorted(det_rules.items(), key=lambda x: -x[1]):
                     det_lines.append(f"- {rule} (x{count})")
-                notify_all(
+                subject = f"[SO SIGMA] {len(high_sigma)} detection(s)"
+                providers = notify_all(
                     cfg.notifications,
-                    f"[SO SIGMA] {len(high_sigma)} detection(s)",
+                    subject,
                     "\n".join(det_lines),
                 )
+                _log_notification(subject, high_sigma, providers)
 
     state.finish_run(alerts=len(all_results), high=high_count)
     print("\n" + summary_text)
