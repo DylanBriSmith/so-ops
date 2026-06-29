@@ -115,6 +115,7 @@ max_alerts_per_query = 2000   # ES query result cap
 max_batch_size = 50           # alerts per LLM batch call
 llm_temperature = 0.1         # low = deterministic classification
 scrub_ips = true              # replace real IPs with tokens (INT-001, EXT-001) before sending to LLM
+scrub_zones = true            # replace subnet CIDRs with tokens (INT-NET-001) in zone context sent to LLM
 
 # Signatures skipped entirely (no LLM call, auto-classified as NOISE).
 # Add any signatures that are confirmed benign in your environment.

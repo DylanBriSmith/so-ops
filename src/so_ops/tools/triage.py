@@ -75,7 +75,7 @@ def _group_alerts(alerts: list) -> dict[str, list]:
     return dict(groups)
 
 
-def _build_zone_context(zones) -> str:
+def _build_zone_context(zones, scrub_zones: bool = True) -> str:
     """Build network context string from configured zones."""
     if not zones:
         return (
@@ -83,8 +83,9 @@ def _build_zone_context(zones) -> str:
             "- Treat RFC1918 addresses as internal, everything else as external"
         )
     lines = []
-    for z in zones:
-        lines.append(f"- {z.cidr} = {z.name} ({z.description})")
+    for i, z in enumerate(zones, 1):
+        cidr = f"INT-NET-{i:03d}" if scrub_zones else z.cidr
+        lines.append(f"- {cidr} = {z.name} ({z.description})")
     return "\n".join(lines)
 
 
@@ -127,6 +128,7 @@ def _build_triage_prompt(
     max_batch: int,
     zones,
     scrub_ips: bool = True,
+    scrub_zones: bool = True,
     internal_prefixes: list[str] | None = None,
 ) -> tuple[str, dict]:
     """Build an LLM prompt for triaging a group of similar alerts.
@@ -147,7 +149,7 @@ def _build_triage_prompt(
     time_range = f"{min(times)} to {max(times)}" if len(times) > 1 else times[0]
     sample = alerts[0]
 
-    zone_context = _build_zone_context(zones)
+    zone_context = _build_zone_context(zones, scrub_zones=scrub_zones)
     ip_legend = (
         "\n- INT-* = internal network addresses, EXT-* = external/internet addresses"
         if scrub_ips and internal_prefixes
@@ -225,6 +227,7 @@ def _triage_with_llm(
         cfg_triage.max_batch_size,
         zones,
         scrub_ips=cfg_triage.scrub_ips,
+        scrub_zones=cfg_triage.scrub_zones,
         internal_prefixes=internal_prefixes,
     )
     raw_response = None
