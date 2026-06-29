@@ -14,9 +14,11 @@ class OllamaClient:
     def __init__(self, cfg: OllamaConfig):
         self._url = cfg.url.rstrip("/")
         self._model = cfg.model
+        self._timeout = cfg.timeout
 
-    def generate(self, prompt: str, temperature: float = 0.1,
-                 max_tokens: int = 2048, timeout: int = 120) -> str:
+    def generate(
+        self, prompt: str, temperature: float = 0.1, max_tokens: int = 2048, timeout: int = 600
+    ) -> str:
         payload = {
             "model": self._model,
             "prompt": prompt,
@@ -28,9 +30,11 @@ class OllamaClient:
         }
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
-            f"{self._url}/api/generate", data=data, method="POST",
+            f"{self._url}/api/generate",
+            data=data,
+            method="POST",
         )
         req.add_header("Content-Type", "application/json")
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp = urllib.request.urlopen(req, timeout=self._timeout)
         result = json.loads(resp.read().decode())
         return result.get("response", "")

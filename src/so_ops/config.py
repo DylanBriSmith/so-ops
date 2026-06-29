@@ -31,6 +31,7 @@ class ESConfig:
 class OllamaConfig:
     url: str
     model: str
+    timeout: int = 600
 
 
 @dataclass
