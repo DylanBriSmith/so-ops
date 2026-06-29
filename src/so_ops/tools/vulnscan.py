@@ -5,15 +5,14 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-from so_ops.config import Config
 from so_ops.clients import make_llm_client
 from so_ops.clients.base import LLMClient
 from so_ops.clients.notify import notify_all
+from so_ops.config import Config
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
 
@@ -30,8 +29,10 @@ def _run_cmd(cmd: list[str], log, timeout: int = 3600) -> tuple[int, str, str]:
 
 # ── nmap ─────────────────────────────────────────────────────────────
 
-def _run_nmap(targets: list[str], nmap_bin: str, nmap_args: str,
-              scan_dir: Path, timestamp: str, log) -> tuple[Path | None, Path | None]:
+
+def _run_nmap(
+    targets: list[str], nmap_bin: str, nmap_args: str, scan_dir: Path, timestamp: str, log
+) -> tuple[Path | None, Path | None]:
     xml_out = scan_dir / f"nmap_{timestamp}.xml"
     txt_out = scan_dir / f"nmap_{timestamp}.txt"
 
@@ -91,8 +92,13 @@ def _parse_nmap_xml(xml_path: Path | None) -> tuple[list, list, list]:
             service_version = service_elem.get("version", "") if service_elem is not None else ""
 
             if service_name in ("http", "https", "http-proxy", "ssl/http"):
-                scheme = ("https" if "ssl" in service_name or "https" in service_name
-                          or port_id in ("443", "8443", "9443") else "http")
+                scheme = (
+                    "https"
+                    if "ssl" in service_name
+                    or "https" in service_name
+                    or port_id in ("443", "8443", "9443")
+                    else "http"
+                )
                 http_targets.append(f"{scheme}://{ip}:{port_id}")
 
             port_info = {
@@ -108,14 +114,16 @@ def _parse_nmap_xml(xml_path: Path | None) -> tuple[list, list, list]:
                         line = line.strip()
                         cve_match = re.match(r"(CVE-\d{4}-\d+)\s+(\d+\.?\d*)", line)
                         if cve_match:
-                            vulns.append({
-                                "host": ip,
-                                "hostname": hostname,
-                                "port": f"{port_id}/{protocol}",
-                                "service": f"{service_product} {service_version}".strip(),
-                                "cve": cve_match.group(1),
-                                "cvss": float(cve_match.group(2)),
-                            })
+                            vulns.append(
+                                {
+                                    "host": ip,
+                                    "hostname": hostname,
+                                    "port": f"{port_id}/{protocol}",
+                                    "service": f"{service_product} {service_version}".strip(),
+                                    "cve": cve_match.group(1),
+                                    "cvss": float(cve_match.group(2)),
+                                }
+                            )
 
             ports_info.append(port_info)
 
@@ -128,9 +136,15 @@ def _parse_nmap_xml(xml_path: Path | None) -> tuple[list, list, list]:
 
 # ── nuclei ───────────────────────────────────────────────────────────
 
-def _run_nuclei(http_targets: list[str], nuclei_docker: str,
-                nuclei_severity: str, scan_dir: Path,
-                timestamp: str, log) -> Path | None:
+
+def _run_nuclei(
+    http_targets: list[str],
+    nuclei_docker: str,
+    nuclei_severity: str,
+    scan_dir: Path,
+    timestamp: str,
+    log,
+) -> Path | None:
     if not http_targets:
         log.info("No HTTP targets found for nuclei scan")
         return None
@@ -141,15 +155,30 @@ def _run_nuclei(http_targets: list[str], nuclei_docker: str,
     targets_file.write_text("\n".join(http_targets) + "\n")
 
     cmd = [
-        "docker", "run", "--rm", "--network=host",
-        "-v", f"{scan_dir}:/output",
-        "-v", f"{targets_file}:/targets.txt:ro",
+        "docker",
+        "run",
+        "--rm",
+        "--network=host",
+        "-v",
+        f"{scan_dir}:/output",
+        "-v",
+        f"{targets_file}:/targets.txt:ro",
         nuclei_docker,
-        "-l", "/targets.txt",
-        "-severity", nuclei_severity,
-        "-jsonl", f"/output/{jsonl_out.name}",
-        "-o", f"/output/{txt_out.name}",
-        "-silent", "-timeout", "10", "-retries", "1", "-rate-limit", "50",
+        "-l",
+        "/targets.txt",
+        "-severity",
+        nuclei_severity,
+        "-jsonl",
+        f"/output/{jsonl_out.name}",
+        "-o",
+        f"/output/{txt_out.name}",
+        "-silent",
+        "-timeout",
+        "10",
+        "-retries",
+        "1",
+        "-rate-limit",
+        "50",
     ]
 
     rc, stdout, stderr = _run_cmd(cmd, log, timeout=3600)
@@ -173,15 +202,19 @@ def _parse_nuclei_jsonl(jsonl_path: Path | None) -> list:
             continue
         try:
             entry = json.loads(line)
-            findings.append({
-                "template_id": entry.get("template-id", ""),
-                "name": entry.get("info", {}).get("name", ""),
-                "severity": entry.get("info", {}).get("severity", ""),
-                "host": entry.get("host", ""),
-                "matched_at": entry.get("matched-at", ""),
-                "description": entry.get("info", {}).get("description", "")[:200],
-                "cve_id": ", ".join(entry.get("info", {}).get("classification", {}).get("cve-id", []) or []),
-            })
+            findings.append(
+                {
+                    "template_id": entry.get("template-id", ""),
+                    "name": entry.get("info", {}).get("name", ""),
+                    "severity": entry.get("info", {}).get("severity", ""),
+                    "host": entry.get("host", ""),
+                    "matched_at": entry.get("matched-at", ""),
+                    "description": entry.get("info", {}).get("description", "")[:200],
+                    "cve_id": ", ".join(
+                        entry.get("info", {}).get("classification", {}).get("cve-id", []) or []
+                    ),
+                }
+            )
         except json.JSONDecodeError:
             continue
     return findings
@@ -189,8 +222,10 @@ def _parse_nuclei_jsonl(jsonl_path: Path | None) -> list:
 
 # ── Report ───────────────────────────────────────────────────────────
 
-def _build_report(hosts: list, vulns: list, nuclei_findings: list,
-                  timestamp: str, scan_types: list[str]) -> str:
+
+def _build_report(
+    hosts: list, vulns: list, nuclei_findings: list, timestamp: str, scan_types: list[str]
+) -> str:
     lines = [
         "# Vulnerability Scan Report",
         f"**Date:** {timestamp}",
@@ -224,13 +259,17 @@ def _build_report(hosts: list, vulns: list, nuclei_findings: list,
         if critical:
             lines.append("### Critical CVEs")
             for v in critical[:20]:
-                lines.append(f"  - **{v['cve']}** (CVSS {v['cvss']}) on {v['host']}:{v['port']} ({v['service']})")
+                lines.append(
+                    f"  - **{v['cve']}** (CVSS {v['cvss']}) on {v['host']}:{v['port']} ({v['service']})"
+                )
             lines.append("")
 
         if high:
             lines.append("### High CVEs")
             for v in high[:30]:
-                lines.append(f"  - {v['cve']} (CVSS {v['cvss']}) on {v['host']}:{v['port']} ({v['service']})")
+                lines.append(
+                    f"  - {v['cve']} (CVSS {v['cvss']}) on {v['host']}:{v['port']} ({v['service']})"
+                )
             lines.append("")
 
     if nuclei_findings:
@@ -275,6 +314,7 @@ Executive Summary:"""
 
 # ── Entry point ──────────────────────────────────────────────────────
 
+
 def run_vulnscan(cfg: Config, scan_type: str = "all"):
     """Main vulnscan entry point. scan_type: 'all', 'nmap', or 'nuclei'."""
     data_dir = cfg.paths.data_dir
@@ -307,8 +347,12 @@ def run_vulnscan(cfg: Config, scan_type: str = "all"):
         xml_out, txt_out = _run_nmap(targets, vs.nmap_bin, vs.nmap_args, scan_dir, timestamp, log)
         if xml_out:
             hosts, vulns, http_targets = _parse_nmap_xml(xml_out)
-            log.info("nmap found %d hosts, %d CVEs, %d HTTP targets",
-                     len(hosts), len(vulns), len(http_targets))
+            log.info(
+                "nmap found %d hosts, %d CVEs, %d HTTP targets",
+                len(hosts),
+                len(vulns),
+                len(http_targets),
+            )
         else:
             log.warning("nmap scan produced no output")
 
@@ -329,8 +373,9 @@ def run_vulnscan(cfg: Config, scan_type: str = "all"):
                             http_targets.append(f"http://{ip}:{port}")
 
         if http_targets:
-            jsonl_out = _run_nuclei(http_targets, vs.nuclei_docker,
-                                    vs.nuclei_severity, scan_dir, timestamp, log)
+            jsonl_out = _run_nuclei(
+                http_targets, vs.nuclei_docker, vs.nuclei_severity, scan_dir, timestamp, log
+            )
             if jsonl_out:
                 nuclei_findings = _parse_nuclei_jsonl(jsonl_out)
                 log.info("nuclei found %d findings", len(nuclei_findings))
@@ -345,7 +390,21 @@ def run_vulnscan(cfg: Config, scan_type: str = "all"):
     log.info("Report saved: %s", report_path)
 
     log.info("=== Generating AI summary ===")
+    llm_log_path = log_dir / "vulnscan_llm_calls.jsonl"
     ai_summary = _generate_ai_summary(report, llm)
+
+    llm_entry = {
+        "called_at": datetime.now(timezone.utc).isoformat(),
+        "tool": "vulnscan",
+        "scan_timestamp": timestamp,
+        "prompt_chars": len(report[:4000]),
+        "hosts_scanned": len(hosts),
+        "cves_found": len(vulns),
+        "nuclei_findings": len(nuclei_findings),
+        "raw_response": ai_summary,
+    }
+    with open(llm_log_path, "a") as f:
+        f.write(json.dumps(llm_entry) + "\n")
 
     if ai_summary:
         full_report = f"## AI Executive Summary\n\n{ai_summary}\n\n---\n\n{report}"
@@ -360,7 +419,18 @@ def run_vulnscan(cfg: Config, scan_type: str = "all"):
     log.info("=== Sending notifications ===")
     vuln_count = len(vulns) + len(nuclei_findings)
     subject = f"[VulnScan] {timestamp} - {len(hosts)} hosts, {vuln_count} findings"
-    notify_all(cfg.notifications, subject, full_report)
+    notify_log_path = log_dir / "vulnscan_notifications.jsonl"
+    providers = notify_all(cfg.notifications, subject, full_report)
+    notify_entry = {
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "subject": subject,
+        "hosts": len(hosts),
+        "cves": len(vulns),
+        "nuclei_findings": len(nuclei_findings),
+        "providers": providers,
+    }
+    with open(notify_log_path, "a") as f:
+        f.write(json.dumps(notify_entry) + "\n")
 
     state.finish_run(hosts=len(hosts), cves=len(vulns), nuclei=len(nuclei_findings))
 

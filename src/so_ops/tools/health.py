@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from so_ops.config import Config
 from so_ops.clients import make_llm_client
 from so_ops.clients.base import LLMClient
 from so_ops.clients.elasticsearch import SOElasticClient
 from so_ops.clients.notify import notify_all
+from so_ops.config import Config
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
 
@@ -23,11 +23,35 @@ def _is_external(ip: str, internal_prefixes: list[str]) -> bool:
     # Exclude broadcast, multicast (224-239), link-local (169.254), and IPv6 non-routable
     if ip in ("255.255.255.255", "0.0.0.0"):
         return False
-    if ip.startswith(("224.", "225.", "226.", "227.", "228.", "229.",
-                      "230.", "231.", "232.", "233.", "234.", "235.",
-                      "236.", "237.", "238.", "239.", "169.254.",
-                      "fe80:", "ff00:", "ff01:", "ff02:", "ff05:",
-                      "ff08:", "ff0e:", "::1")):
+    if ip.startswith(
+        (
+            "224.",
+            "225.",
+            "226.",
+            "227.",
+            "228.",
+            "229.",
+            "230.",
+            "231.",
+            "232.",
+            "233.",
+            "234.",
+            "235.",
+            "236.",
+            "237.",
+            "238.",
+            "239.",
+            "169.254.",
+            "fe80:",
+            "ff00:",
+            "ff01:",
+            "ff02:",
+            "ff05:",
+            "ff08:",
+            "ff0e:",
+            "::1",
+        )
+    ):
         return False
     return not any(ip.startswith(p) for p in internal_prefixes)
 
@@ -134,19 +158,23 @@ def _get_data_stream_health(es: SOElasticClient, pattern: str, log) -> list:
         for ds in streams_raw:
             name = ds["name"]
             try:
-                recent_count = es.count(name, {"query": {"range": {"@timestamp": {"gte": "now-1h"}}}})
+                recent_count = es.count(
+                    name, {"query": {"range": {"@timestamp": {"gte": "now-1h"}}}}
+                )
             except Exception:
                 recent_count = -1
             try:
                 total_count = es.count(name)
             except Exception:
                 total_count = -1
-            streams.append({
-                "name": name,
-                "status": ds.get("status", "unknown"),
-                "recent_1h": recent_count,
-                "total": total_count,
-            })
+            streams.append(
+                {
+                    "name": name,
+                    "status": ds.get("status", "unknown"),
+                    "recent_1h": recent_count,
+                    "total": total_count,
+                }
+            )
         return streams
     except Exception as exc:
         log.warning("Data stream health check failed: %s", exc)
@@ -203,8 +231,9 @@ def _get_external_ips(es: SOElasticClient, index: str, internal_prefixes: list[s
         return []
 
 
-def _build_report(suricata, zeek, detections, syslog_errors, streams,
-                  triage, ext_ips, internal_prefixes) -> str:
+def _build_report(
+    suricata, zeek, detections, syslog_errors, streams, triage, ext_ips, internal_prefixes
+) -> str:
     now = datetime.now(timezone.utc)
     lines = [
         "# Daily Network & Event Health Report",
@@ -226,8 +255,10 @@ def _build_report(suricata, zeek, detections, syslog_errors, streams,
         stale = [s for s in streams if s["recent_1h"] == 0]
         if stale:
             lines.append("")
-            lines.append(f"**Warning:** {len(stale)} stream(s) with 0 docs in the last hour: "
-                         f"{', '.join(s['name'] for s in stale)}")
+            lines.append(
+                f"**Warning:** {len(stale)} stream(s) with 0 docs in the last hour: "
+                f"{', '.join(s['name'] for s in stale)}"
+            )
     else:
         lines.append("*Data stream health check failed*")
     lines.append("")
@@ -329,7 +360,9 @@ def _build_report(suricata, zeek, detections, syslog_errors, streams,
             bytes_out = aggs.get("resp_bytes", {}).get("value", 0) or 0
 
         lines.append(f"**Total connections (24h):** {total_conns:,}")
-        lines.append(f"**Data transferred:** {_format_bytes(bytes_in)} in / {_format_bytes(bytes_out)} out")
+        lines.append(
+            f"**Data transferred:** {_format_bytes(bytes_in)} in / {_format_bytes(bytes_out)} out"
+        )
         lines.append("")
 
         proto_buckets = aggs.get("by_proto", {}).get("buckets", [])
@@ -398,8 +431,7 @@ def _build_zone_context(zones) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def _generate_llm_briefing(raw_report: str, llm: LLMClient,
-                           temperature: float, zones) -> str:
+def _generate_llm_briefing(raw_report: str, llm: LLMClient, temperature: float, zones) -> str:
     zone_context = _build_zone_context(zones)
 
     prompt = f"""You are a Security Operations Center analyst producing a morning briefing for the network administrator of a home lab / small business network.
@@ -470,17 +502,28 @@ def run_health(cfg: Config):
     ext_ips = _get_external_ips(es, indices.zeek, internal_prefixes, log)
 
     log.info("Building raw report...")
-    raw_report = _build_report(suricata, zeek, detections, syslog_errors,
-                               streams, triage, ext_ips, internal_prefixes)
+    raw_report = _build_report(
+        suricata, zeek, detections, syslog_errors, streams, triage, ext_ips, internal_prefixes
+    )
 
     log.info("Generating AI briefing...")
+    llm_log_path = log_dir / "health_llm_calls.jsonl"
     briefing = _generate_llm_briefing(raw_report, llm, cfg.health.llm_temperature, zones)
+
+    llm_entry = {
+        "called_at": datetime.now(timezone.utc).isoformat(),
+        "tool": "health",
+        "prompt_chars": len(raw_report),
+        "raw_response": briefing,
+    }
+    with open(llm_log_path, "a") as f:
+        f.write(json.dumps(llm_entry) + "\n")
 
     now = datetime.now(timezone.utc)
     output_dir.mkdir(parents=True, exist_ok=True)
     report_file = output_dir / f"health_{now.strftime('%Y%m%d_%H%M%S')}.md"
 
-    final_report = f"""# Morning Briefing — {now.strftime('%A, %B %d, %Y')}
+    final_report = f"""# Morning Briefing — {now.strftime("%A, %B %d, %Y")}
 
 {briefing}
 
@@ -494,7 +537,15 @@ def run_health(cfg: Config):
     log.info("Sending notifications...")
     first_line = briefing.split("\n")[0][:60] if briefing else ""
     email_subject = f"SO Daily Health — {now.strftime('%A %b %d')} — {first_line}"
-    notify_all(cfg.notifications, email_subject, final_report)
+    notify_log_path = log_dir / "health_notifications.jsonl"
+    providers = notify_all(cfg.notifications, email_subject, final_report)
+    notify_entry = {
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "subject": email_subject,
+        "providers": providers,
+    }
+    with open(notify_log_path, "a") as f:
+        f.write(json.dumps(notify_entry) + "\n")
 
     elapsed = time.time() - start
     state.finish_run(report=str(report_file))

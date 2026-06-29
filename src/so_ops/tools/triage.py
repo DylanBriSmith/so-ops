@@ -337,7 +337,7 @@ def run_triage(cfg: Config, dry_run: bool = False):
     state_dir = data_dir / "state"
     summary_dir = data_dir / "output" / "triage" / "summaries"
     jsonl_path = log_dir / "triage.jsonl"
-    llm_log_path = log_dir / "llm_calls.jsonl"
+    llm_log_path = log_dir / "triage_llm_calls.jsonl"
 
     log = setup_logging("triage", log_dir)
     state = ToolState("triage", state_dir)
@@ -451,7 +451,7 @@ def run_triage(cfg: Config, dry_run: bool = False):
 
     high_count = sum(1 for r in all_results if r["verdict"] == "HIGH")
 
-    notify_log_path = log_dir / "notifications.jsonl"
+    notify_log_path = log_dir / "triage_notifications.jsonl"
 
     def _log_notification(subject: str, alerts_sent: list, providers: dict[str, bool]):
         """Append a structured record of a dispatched notification."""
