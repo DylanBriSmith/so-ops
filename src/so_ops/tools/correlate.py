@@ -133,8 +133,23 @@ def _correlate_alert_patterns(
     entries: list[dict],
     internal_prefixes: list[str],
     log,
+    window_minutes: float = 2880,
 ) -> list[dict]:
-    """Detect behavioural patterns purely within the triage alert log."""
+    """Detect behavioural patterns purely within the triage alert log.
+
+    window_minutes is used to scale volume-based thresholds so short lookbacks
+    (e.g. 20 min) don't require the same raw counts as a 48h window.
+    """
+    # Scale volume thresholds proportionally; floor prevents them going to zero
+    _window_hours = window_minutes / 60
+    high_vol_min = max(10, int(_HIGH_VOL_MIN * _window_hours / 48))
+    flood_min = max(20, int(_SINGLE_RULE_FLOOD_MIN * _window_hours / 48))
+    log.info(
+        "Threshold scaling (%.0fm window): high_vol_min=%d, flood_min=%d",
+        window_minutes,
+        high_vol_min,
+        flood_min,
+    )
 
     # Index structures
     by_src: dict[str, list[dict]] = defaultdict(list)
@@ -417,7 +432,7 @@ def _correlate_alert_patterns(
 
     # ── Pattern 7: high-volume single source ───────────────────────────
     for src_ip, src_entries in by_src.items():
-        if len(src_entries) < _HIGH_VOL_MIN:
+        if len(src_entries) < high_vol_min:
             continue
 
         distinct_rules = {e["rule_name"] for e in src_entries}
@@ -565,7 +580,7 @@ def _correlate_alert_patterns(
             by_src_rule[(src, rule)].append(e)
 
     for (src_ip, rule_name), flood_entries in by_src_rule.items():
-        if len(flood_entries) < _SINGLE_RULE_FLOOD_MIN:
+        if len(flood_entries) < flood_min:
             continue
 
         dest_ips = sorted(
@@ -1432,6 +1447,7 @@ def _summarize_with_llm(
     vuln_findings: list[dict],
     cfg: Config,
     log,
+    lookback_label: str = "48h",
 ) -> str | None:
     """Send HIGH+MEDIUM findings to LLM and get a prioritised analyst brief.
 
@@ -1480,7 +1496,7 @@ def _summarize_with_llm(
     # Build prompt
     prompt_lines = [
         "You are a Security Operations Center analyst reviewing automated correlation findings.",
-        "Below are HIGH and MEDIUM confidence security patterns detected in the last 48 hours.",
+        f"Below are HIGH and MEDIUM confidence security patterns detected in the last {lookback_label}.",
         "",
         "Your tasks:",
         "1. Identify the top 3-5 most urgent findings that need immediate investigation.",
@@ -1621,7 +1637,9 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
 
     # ── Pass 1: alert × alert patterns ───────────────────────────────
     log.info("=== Pass 1: alert pattern detection (%d alerts) ===", len(entries))
-    patterns = _correlate_alert_patterns(entries, cfg.network.internal_prefixes, log)
+    patterns = _correlate_alert_patterns(
+        entries, cfg.network.internal_prefixes, log, window_minutes=_lookback.total_seconds() / 60
+    )
     log.info(
         "Patterns: %d total (%d high, %d medium, %d low)",
         len(patterns),
@@ -1673,7 +1691,9 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
 
     # ── Pass 3: LLM analyst brief ─────────────────────────────────────
     log.info("=== Pass 3: LLM analyst brief ===")
-    llm_brief = _summarize_with_llm(patterns, vuln_findings, cfg, log)
+    llm_brief = _summarize_with_llm(
+        patterns, vuln_findings, cfg, log, lookback_label=_lookback_label
+    )
 
     # ── Build report ──────────────────────────────────────────────────
     report = _build_report(
@@ -1724,6 +1744,19 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
                 detail_lines.append(f"  Rule: {rule}")
             detail_lines.append(f"  Reason: {p.get('reason', '')}")
             detail_lines.append("")
+
+        if changes:
+            detail_lines.append("VERDICT UPGRADES FROM VULN CORRELATION:")
+            for f in changes:
+                detail_lines.append(
+                    f"  [{f['triage_verdict']} -> {f['recommended_verdict']}] {f['rule_name'][:60]}"
+                )
+                detail_lines.append(
+                    f"    {f['source_ip']} -> {f['dest_ip']}:{f['dest_port']}"
+                    f" | matched {f['matched_ip']} ({f['match_type']})"
+                )
+                detail_lines.append(f"    {f['reason']}")
+                detail_lines.append("")
 
         detail_block = "\n".join(detail_lines).strip()
         notify_body = (
