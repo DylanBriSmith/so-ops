@@ -259,6 +259,171 @@ def _recommend_verdict(match_type: str, current_verdict: str) -> str:
 # ── Core correlation ──────────────────────────────────────────────────────────
 
 
+def _correlate_one_ip(
+    entry: dict,
+    ip: str,
+    direction: str,
+    nmap_index: dict[str, dict],
+    nuclei_index: dict[str, list[dict]],
+    log,
+) -> list[dict]:
+    """Try to correlate a single IP (src or dest) against scan results.
+
+    direction is 'inbound' (ip is dest — attacker targeting this host) or
+    'outbound' (ip is src — this internal host is doing something suspicious).
+    """
+    rule_name = entry.get("rule_name", "")
+    verdict = entry.get("verdict", "LOW")
+
+    host_info = nmap_index.get(ip)
+    nuclei_findings = nuclei_index.get(ip, [])
+
+    if not host_info and not nuclei_findings:
+        return []
+
+    role = "source host" if direction == "outbound" else "destination host"
+    rule_cves = _cves_in_rule(rule_name)
+    host_cves = {c["cve"].upper(): c for c in (host_info["cves"] if host_info else [])}
+    host_services = host_info["services"] if host_info else []
+    matched = False
+    findings: list[dict] = []
+
+    # Tier 1 — exact CVE match
+    for cve in rule_cves:
+        if cve.upper() in host_cves:
+            scan_cve = host_cves[cve.upper()]
+            reason = (
+                f"Rule references {cve} which vulnscan confirmed on "
+                f"{ip}:{scan_cve['port']} ({scan_cve['service']}, CVSS {scan_cve['cvss']}) "
+                f"[{role}]"
+            )
+            findings.append(
+                _build_finding(
+                    entry,
+                    ip,
+                    direction,
+                    host_info,
+                    MATCH_EXACT_CVE,
+                    verdict,
+                    reason,
+                    matched_cves=[cve],
+                    scan_cve_detail=scan_cve,
+                )
+            )
+            matched = True
+            log.info(
+                "  EXACT CVE [%s]: %s → %s on %s (CVSS %.1f)",
+                direction,
+                rule_name[:55],
+                cve,
+                ip,
+                scan_cve["cvss"],
+            )
+
+    # Tier 2 — nuclei CVE match
+    for nf in nuclei_findings:
+        overlap = set(cve.upper() for cve in rule_cves) & set(c.upper() for c in nf["cve_ids"])
+        if overlap:
+            reason = (
+                f"Rule references {', '.join(overlap)} and nuclei confirmed "
+                f"'{nf['name']}' at {nf['matched_at']} (severity: {nf['severity']}) [{role}]"
+            )
+            findings.append(
+                _build_finding(
+                    entry,
+                    ip,
+                    direction,
+                    host_info,
+                    MATCH_NUCLEI_CVE,
+                    verdict,
+                    reason,
+                    matched_cves=list(overlap),
+                    nuclei_finding=nf,
+                )
+            )
+            matched = True
+            log.info(
+                "  NUCLEI CVE [%s]: %s → %s on %s",
+                direction,
+                rule_name[:55],
+                ", ".join(overlap),
+                ip,
+            )
+            continue
+
+        if nf["severity"] in ("critical", "high") and not matched and _is_exploit_rule(rule_name):
+            reason = (
+                f"Exploit rule involving {ip} where nuclei confirmed "
+                f"'{nf['name']}' ({nf['severity']}) at {nf['matched_at']} [{role}]"
+            )
+            findings.append(
+                _build_finding(
+                    entry,
+                    ip,
+                    direction,
+                    host_info,
+                    MATCH_NUCLEI_CVE,
+                    verdict,
+                    reason,
+                    nuclei_finding=nf,
+                )
+            )
+            matched = True
+            log.info("  NUCLEI HOST [%s]: %s → %s on %s", direction, rule_name[:55], nf["name"], ip)
+
+    # Tier 3 — service keyword match
+    if not matched and host_services:
+        svc_matches = _service_keywords_match(rule_name, host_services)
+        if svc_matches:
+            reason = (
+                f"Rule mentions product also found open on {ip} ({role}): "
+                f"{', '.join(svc_matches[:3])}"
+            )
+            findings.append(
+                _build_finding(
+                    entry,
+                    ip,
+                    direction,
+                    host_info,
+                    MATCH_SERVICE_KEYWORD,
+                    verdict,
+                    reason,
+                    matched_services=svc_matches,
+                )
+            )
+            matched = True
+            log.info("  SERVICE [%s]: %s → %s on %s", direction, rule_name[:55], svc_matches[0], ip)
+
+    # Tier 4 — host involved in exploit/attack rule and has known CVEs
+    if not matched and host_info and host_info["cves"] and _is_exploit_rule(rule_name):
+        top_cve = host_info["cves"][0]
+        reason = (
+            f"Exploit/attack rule involving {ip} ({role}), which has "
+            f"{len(host_info['cves'])} known CVEs (highest: {top_cve['cve']} "
+            f"CVSS {top_cve['cvss']})"
+        )
+        findings.append(
+            _build_finding(
+                entry,
+                ip,
+                direction,
+                host_info,
+                MATCH_TARGETED_HOST,
+                verdict,
+                reason,
+            )
+        )
+        log.info(
+            "  TARGETED HOST [%s]: %s → %s (%d CVEs)",
+            direction,
+            rule_name[:55],
+            ip,
+            len(host_info["cves"]),
+        )
+
+    return findings
+
+
 def _correlate(
     triage_entries: list[dict],
     nmap_index: dict[str, dict],
@@ -267,154 +432,30 @@ def _correlate(
 ) -> list[dict]:
     """Return a list of correlation findings sorted by confidence (high first)."""
     findings: list[dict] = []
+    seen: set[tuple] = set()  # deduplicate on (alert_id, ip, match_type)
 
     for entry in triage_entries:
+        src_ip = entry.get("source_ip", "")
         dest_ip = entry.get("dest_ip", "")
         rule_name = entry.get("rule_name", "")
-        verdict = entry.get("verdict", "LOW")
 
-        if not dest_ip or dest_ip == "?":
-            continue
+        # Check dest_ip (inbound: attacker → internal victim)
+        if dest_ip and dest_ip != "?":
+            for f in _correlate_one_ip(entry, dest_ip, "inbound", nmap_index, nuclei_index, log):
+                key = (f["alert_id"], dest_ip, f["match_type"])
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(f)
 
-        host_info = nmap_index.get(dest_ip)
-        nuclei_findings = nuclei_index.get(dest_ip, [])
+        # Check src_ip (outbound: internal host doing something suspicious)
+        if src_ip and src_ip != "?" and src_ip != dest_ip:
+            for f in _correlate_one_ip(entry, src_ip, "outbound", nmap_index, nuclei_index, log):
+                key = (f["alert_id"], src_ip, f["match_type"])
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(f)
 
-        if not host_info and not nuclei_findings:
-            continue  # host not in any scan results — no correlation possible
-
-        rule_cves = _cves_in_rule(rule_name)
-        host_cves = {c["cve"].upper(): c for c in (host_info["cves"] if host_info else [])}
-        host_services = host_info["services"] if host_info else []
-
-        matched = False
-
-        # Tier 1 — exact CVE match (rule names CVE that vulnscan found on this host)
-        for cve in rule_cves:
-            if cve.upper() in host_cves:
-                scan_cve = host_cves[cve.upper()]
-                reason = (
-                    f"Rule references {cve} which vulnscan confirmed on "
-                    f"{dest_ip}:{scan_cve['port']} ({scan_cve['service']}, "
-                    f"CVSS {scan_cve['cvss']})"
-                )
-                findings.append(
-                    _build_finding(
-                        entry,
-                        dest_ip,
-                        host_info,
-                        MATCH_EXACT_CVE,
-                        verdict,
-                        reason,
-                        matched_cves=[cve],
-                        scan_cve_detail=scan_cve,
-                    )
-                )
-                matched = True
-                log.info(
-                    "  EXACT CVE: %s → %s on %s (CVSS %.1f)",
-                    rule_name[:60],
-                    cve,
-                    dest_ip,
-                    scan_cve["cvss"],
-                )
-
-        # Tier 2 — nuclei CVE match (nuclei confirmed a CVE also in the rule, or on same host)
-        for nf in nuclei_findings:
-            # Sub-tier 2a: nuclei's CVE IDs overlap with rule's CVE IDs
-            overlap = set(cve.upper() for cve in rule_cves) & set(c.upper() for c in nf["cve_ids"])
-            if overlap:
-                reason = (
-                    f"Rule references {', '.join(overlap)} and nuclei confirmed "
-                    f"'{nf['name']}' at {nf['matched_at']} (severity: {nf['severity']})"
-                )
-                findings.append(
-                    _build_finding(
-                        entry,
-                        dest_ip,
-                        host_info,
-                        MATCH_NUCLEI_CVE,
-                        verdict,
-                        reason,
-                        matched_cves=list(overlap),
-                        nuclei_finding=nf,
-                    )
-                )
-                matched = True
-                log.info("  NUCLEI CVE: %s → %s on %s", rule_name[:60], ", ".join(overlap), dest_ip)
-                continue
-
-            # Sub-tier 2b: nuclei hit on same host with a high/critical finding
-            if (
-                nf["severity"] in ("critical", "high")
-                and not matched
-                and _is_exploit_rule(rule_name)
-            ):
-                reason = (
-                    f"Exploit rule fired against {dest_ip} where nuclei confirmed "
-                    f"'{nf['name']}' ({nf['severity']}) at {nf['matched_at']}"
-                )
-                findings.append(
-                    _build_finding(
-                        entry,
-                        dest_ip,
-                        host_info,
-                        MATCH_NUCLEI_CVE,
-                        verdict,
-                        reason,
-                        nuclei_finding=nf,
-                    )
-                )
-                matched = True
-                log.info("  NUCLEI HOST: %s → %s on %s", rule_name[:60], nf["name"], dest_ip)
-
-        # Tier 3 — service keyword match
-        if not matched and host_services:
-            svc_matches = _service_keywords_match(rule_name, host_services)
-            if svc_matches:
-                reason = (
-                    f"Rule mentions product also found open on {dest_ip}: "
-                    f"{', '.join(svc_matches[:3])}"
-                )
-                findings.append(
-                    _build_finding(
-                        entry,
-                        dest_ip,
-                        host_info,
-                        MATCH_SERVICE_KEYWORD,
-                        verdict,
-                        reason,
-                        matched_services=svc_matches,
-                    )
-                )
-                matched = True
-                log.info("  SERVICE: %s → %s on %s", rule_name[:60], svc_matches[0], dest_ip)
-
-        # Tier 4 — host targeted (exploit rule vs any known-vulnerable host)
-        if not matched and host_info and host_info["cves"] and _is_exploit_rule(rule_name):
-            top_cve = host_info["cves"][0]
-            reason = (
-                f"Exploit/attack rule targeting {dest_ip}, which has "
-                f"{len(host_info['cves'])} known CVEs (highest: {top_cve['cve']} "
-                f"CVSS {top_cve['cvss']})"
-            )
-            findings.append(
-                _build_finding(
-                    entry,
-                    dest_ip,
-                    host_info,
-                    MATCH_TARGETED_HOST,
-                    verdict,
-                    reason,
-                )
-            )
-            log.info(
-                "  TARGETED HOST: %s → %s (%d CVEs)",
-                rule_name[:60],
-                dest_ip,
-                len(host_info["cves"]),
-            )
-
-    # Sort: high confidence first, then by recommended verdict severity descending
+    # Sort: high confidence first, then by recommended verdict severity
     order_conf = {"high": 0, "medium": 1, "low": 2}
     order_verd = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "NOISE": 3}
     findings.sort(
@@ -423,13 +464,13 @@ def _correlate(
             order_verd.get(f["recommended_verdict"], 9),
         )
     )
-
     return findings
 
 
 def _build_finding(
     triage_entry: dict,
-    dest_ip: str,
+    matched_ip: str,
+    direction: str,
     host_info: dict | None,
     match_type: str,
     current_verdict: str,
@@ -446,8 +487,10 @@ def _build_finding(
         "alert_timestamp": triage_entry.get("alert_timestamp", ""),
         "rule_name": triage_entry.get("rule_name", ""),
         "source_ip": triage_entry.get("source_ip", ""),
-        "dest_ip": dest_ip,
+        "dest_ip": triage_entry.get("dest_ip", ""),
         "dest_port": triage_entry.get("dest_port", ""),
+        "matched_ip": matched_ip,
+        "direction": direction,
         "triage_verdict": current_verdict,
         "triage_method": triage_entry.get("method", ""),
         "match_type": match_type,
@@ -518,7 +561,7 @@ def _build_report(
                 f"`{f['triage_verdict']} → {f['recommended_verdict']}`  "
                 f"[{f['confidence']} confidence]"
             )
-            lines.append(f"  - Target: `{f['dest_ip']}` | Match: `{f['match_type']}`")
+            lines.append(f"  - `{f['matched_ip']}` ({f['direction']}) | Match: `{f['match_type']}`")
             lines.append(f"  - {f['reason']}")
             lines.append("")
 
@@ -529,8 +572,10 @@ def _build_report(
             hostname = f" ({f['host_hostname']})" if f["host_hostname"] else ""
             lines.append(f"### {f['rule_name'][:80]}")
             lines.append(
-                f"- **Alert:** `{f['alert_timestamp']}` | {f['source_ip']} → {f['dest_ip']}{hostname}:{f['dest_port']}"
+                f"- **Alert:** `{f['alert_timestamp']}` | "
+                f"{f['source_ip']} → {f['dest_ip']}:{f['dest_port']}"
             )
+            lines.append(f"- **Matched host:** `{f['matched_ip']}`{hostname} ({f['direction']})")
             lines.append(
                 f"- **Triage verdict:** {f['triage_verdict']} (method: {f['triage_method']})"
             )
@@ -541,7 +586,8 @@ def _build_report(
             if f["scan_cve_detail"]:
                 d = f["scan_cve_detail"]
                 lines.append(
-                    f"- **Scan detail:** {d['cve']} CVSS {d['cvss']} on {f['dest_ip']}:{d['port']} ({d['service']})"
+                    f"- **Scan detail:** {d['cve']} CVSS {d['cvss']} on "
+                    f"{f['matched_ip']}:{d['port']} ({d['service']})"
                 )
             if f["nuclei_finding"]:
                 nf = f["nuclei_finding"]
@@ -553,7 +599,7 @@ def _build_report(
         lines.append("")
         for f in med_conf:
             lines.append(
-                f"- **{f['rule_name'][:70]}** → `{f['dest_ip']}` | "
+                f"- **{f['rule_name'][:70]}** → `{f['matched_ip']}` ({f['direction']}) | "
                 f"{f['triage_verdict']}→{f['recommended_verdict']} | {f['reason']}"
             )
         lines.append("")
@@ -563,8 +609,8 @@ def _build_report(
         lines.append("")
         for f in low_conf:
             lines.append(
-                f"- **{f['rule_name'][:70]}** → `{f['dest_ip']}` ({f['host_cve_count']} CVEs, "
-                f"top CVSS {f['host_top_cvss']}) | {f['triage_verdict']}"
+                f"- **{f['rule_name'][:70]}** → `{f['matched_ip']}` ({f['direction']}, "
+                f"{f['host_cve_count']} CVEs, top CVSS {f['host_top_cvss']}) | {f['triage_verdict']}"
             )
         lines.append("")
 
@@ -729,7 +775,7 @@ def run_correlate(cfg: Config, lookback_hours: int = 48):
         print("\nHIGH CONFIDENCE FINDINGS:")
         for f in high:
             print(f"  [{f['recommended_verdict']}] {f['rule_name'][:65]}")
-            print(f"        → {f['dest_ip']} | {f['reason'][:80]}")
+            print(f"        → {f['matched_ip']} ({f['direction']}) | {f['reason'][:72]}")
 
     if changes:
         print("\nRECOMMENDED UPGRADES:")
