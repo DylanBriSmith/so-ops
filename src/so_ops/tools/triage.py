@@ -17,6 +17,60 @@ from so_ops.log import setup_logging
 from so_ops.state import ToolState
 
 
+def _flow_key(alert: dict) -> tuple:
+    """Return a stable key for the network flow an alert belongs to."""
+    cid = alert.get("community_id") or ""
+    if cid:
+        return ("cid", cid)
+    return (
+        "5tuple",
+        alert["source_ip"],
+        alert["dest_ip"],
+        alert["source_port"],
+        alert["dest_port"],
+        alert.get("protocol", "?"),
+    )
+
+
+def _group_alerts_by_flow(alerts: list) -> dict[tuple, list]:
+    """Group alerts that share the same network flow."""
+    groups: dict[tuple, list] = defaultdict(list)
+    for alert in alerts:
+        groups[_flow_key(alert)].append(alert)
+    return dict(groups)
+
+
+def _correlated_rule_names(alert: dict, flow_groups: dict[tuple, list]) -> list[str]:
+    """Other rule names that fired on the same flow as this alert."""
+    siblings = flow_groups.get(_flow_key(alert), [])
+    return sorted({a["rule_name"] for a in siblings if a["id"] != alert["id"]})
+
+
+def _correlated_rules_for_group(group_alerts: list, flow_groups: dict[tuple, list]) -> list[str]:
+    """Union of correlated rule names across all alerts in a triage group."""
+    names: set[str] = set()
+    for alert in group_alerts:
+        names.update(_correlated_rule_names(alert, flow_groups))
+    return sorted(names)
+
+
+def _correlated_escalation(
+    correlated_rules: list[str], verdict: str, min_medium: list[str], min_high: list[str]
+) -> tuple[str, str]:
+    """Check if correlated rules on the same flow warrant escalation.
+    Returns (new_verdict, escalation_reason) or (verdict, '') if no change."""
+    severity_order = {"NOISE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+    current = severity_order.get(verdict, 1)
+    for corr_rule in correlated_rules:
+        for pattern in min_high:
+            if pattern in corr_rule and current < 3:
+                return "HIGH", f"correlated flow also triggered {corr_rule!r} (HIGH pattern)"
+        for pattern in min_medium:
+            if (corr_rule.startswith(pattern) or pattern in corr_rule) and current < 2:
+                return "MEDIUM", f"correlated flow also triggered {corr_rule!r} (MEDIUM pattern)"
+    return verdict, ""
+
+
 def _extract_alert_summary(hit: dict) -> dict:
     """Extract key fields from an ES alert hit into a concise dict."""
     src = hit["_source"]
@@ -46,6 +100,7 @@ def _extract_alert_summary(hit: dict) -> dict:
         "source_port": source.get("port", "?"),
         "dest_ip": dest.get("ip", "?"),
         "dest_port": dest.get("port", "?"),
+        "protocol": src.get("network", {}).get("transport", "?"),
         "community_id": src.get("network", {}).get("community_id", ""),
         "ruleset": rule.get("ruleset", ""),
         "action": rule.get("action", alert_info.get("action", "")),
@@ -130,6 +185,7 @@ def _build_triage_prompt(
     scrub_ips: bool = True,
     scrub_zones: bool = True,
     internal_prefixes: list[str] | None = None,
+    correlated_rules: list[str] | None = None,
 ) -> tuple[str, dict]:
     """Build an LLM prompt for triaging a group of similar alerts.
     Returns (prompt, ip_map) where ip_map is token->real_ip (empty if not scrubbing)."""
@@ -155,6 +211,11 @@ def _build_triage_prompt(
         if scrub_ips and internal_prefixes
         else ""
     )
+    correlated_line = (
+        f"- Other rules on same flow: {', '.join(correlated_rules[:10])}\n"
+        if correlated_rules
+        else ""
+    )
 
     prompt = f"""You are a Security Operations Center analyst triaging IDS alerts from a home/small business network.
 
@@ -174,7 +235,7 @@ Alert group to triage:
 - Alert count: {len(alerts)}
 - Time range: {time_range}
 - Action: {sample["action"]}
-
+{correlated_line}
 Classify this alert group into ONE of these categories:
 - NOISE: Expected/benign traffic for this network type. No action needed.
 - LOW: Minor finding, FYI only. Log and move on.
@@ -220,8 +281,10 @@ def _triage_with_llm(
     log,
     llm_log_path: Path | None = None,
     internal_prefixes: list[str] | None = None,
+    flow_groups: dict | None = None,
 ) -> dict:
     """Send alert group to LLM for triage classification."""
+    correlated_rules = _correlated_rules_for_group(alerts, flow_groups) if flow_groups else []
     prompt, ip_map = _build_triage_prompt(
         alerts,
         cfg_triage.max_batch_size,
@@ -229,6 +292,7 @@ def _triage_with_llm(
         scrub_ips=cfg_triage.scrub_ips,
         scrub_zones=cfg_triage.scrub_zones,
         internal_prefixes=internal_prefixes,
+        correlated_rules=correlated_rules,
     )
     raw_response = None
     verdict_info = {
@@ -462,6 +526,7 @@ def run_triage(cfg: Config, dry_run: bool = False):
                 log.info("Also found %d Sigma detection alerts", len(all_detection_alerts))
 
         alerts = [_extract_alert_summary(hit) for hit in hits]
+        flow_groups = _group_alerts_by_flow(alerts)
         auto_noise, needs_review = _classify_auto_noise(alerts, noise_sigs)
         log.info(
             "Auto-classified %d as NOISE, %d need LLM review", len(auto_noise), len(needs_review)
@@ -504,6 +569,7 @@ def run_triage(cfg: Config, dry_run: bool = False):
                     log,
                     llm_log_path,
                     internal_prefixes=cfg.network.internal_prefixes,
+                    flow_groups=flow_groups,
                 )
                 verdict_info["method"] = "llm"
                 log.info("    -> %s: %s", verdict_info["verdict"], verdict_info["reason"][:80])
@@ -534,7 +600,23 @@ def run_triage(cfg: Config, dry_run: bool = False):
                     cfg.triage.escalation.minimum_high,
                 )
 
-                if verdict != base_verdict:
+                # Check if correlated flows warrant further escalation
+                correlated = _correlated_rules_for_group(group_alerts_list, flow_groups)
+                corr_verdict, corr_reason = _correlated_escalation(
+                    correlated,
+                    verdict,
+                    cfg.triage.escalation.minimum_medium,
+                    cfg.triage.escalation.minimum_high,
+                )
+
+                if corr_verdict != verdict:
+                    reason = (
+                        f"Suricata severity {raw_sev} ({base_verdict}), "
+                        f"escalated to {corr_verdict}: {corr_reason}"
+                    )
+                    method = "rule-correlated"
+                    verdict = corr_verdict
+                elif verdict != base_verdict:
                     reason = (
                         f"Suricata severity {raw_sev} ({base_verdict}) "
                         f"escalated to {verdict} by rule pattern"
@@ -547,9 +629,10 @@ def run_triage(cfg: Config, dry_run: bool = False):
                     reason = f"Suricata severity {raw_sev} — would need LLM to confirm or downgrade to NOISE"
                     method = "needs-llm"
 
+                corr_note = f" [correlated: {', '.join(correlated[:3])}]" if correlated else ""
                 verdict_info = {
                     "verdict": verdict,
-                    "reason": reason,
+                    "reason": reason + corr_note,
                     "recommendation": "Dry run — no action taken",
                     "method": method,
                 }
