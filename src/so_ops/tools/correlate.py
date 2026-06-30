@@ -1,42 +1,436 @@
-"""Alert-vulnscan correlation: cross-reference triage results with scan findings, no LLM."""
+"""Alert correlation engine: alert×alert patterns + alert×vulnscan cross-reference. No LLM."""
 
 from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-# Prefer defusedxml to guard against malformed XML; fall back to stdlib.
-# The nmap XML is always local output, but defence-in-depth is cheap.
 try:
     import defusedxml.ElementTree as ET  # type: ignore[import]
 except ImportError:
     import xml.etree.ElementTree as ET  # type: ignore[no-redef]
-from pathlib import Path
 
 from so_ops.config import Config
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
 
-# ── Match confidence tiers ────────────────────────────────────────────────────
+# ── Rule category helpers ─────────────────────────────────────────────────────
 
-MATCH_EXACT_CVE = "exact_cve"  # rule name contains CVE that vulnscan found on dest_ip
-MATCH_NUCLEI_CVE = "nuclei_cve"  # nuclei confirmed same CVE / template on dest_ip
-MATCH_SERVICE_KEYWORD = "service_keyword"  # rule mentions a product found open on dest_ip
-MATCH_TARGETED_HOST = "targeted_host"  # exploit/attack rule aimed at a host with any known CVE
+_CATEGORY_MAP: list[tuple[str, str]] = [
+    ("ET EXPLOIT", "exploit"),
+    ("ET TROJAN", "trojan"),
+    ("ET MALWARE", "malware"),
+    ("ET SHELLCODE", "shellcode"),
+    ("ET ATTACK", "attack"),
+    ("ET SCAN", "scan"),
+    ("ET DOS", "dos"),
+    ("ET WEB_SERVER", "web_server"),
+    ("ET WEB_CLIENT", "web_client"),
+    ("ET INFO", "info"),
+    ("ET POLICY", "policy"),
+    ("GPL EXPLOIT", "exploit"),
+    ("GPL SHELLCODE", "shellcode"),
+    ("GPL ATTACK", "attack"),
+    ("GPL SCAN", "scan"),
+]
 
-CONFIDENCE = {
-    MATCH_EXACT_CVE: "high",
-    MATCH_NUCLEI_CVE: "high",
-    MATCH_SERVICE_KEYWORD: "medium",
-    MATCH_TARGETED_HOST: "low",
-}
+_HIGH_SEVERITY_CATS = frozenset(["exploit", "trojan", "malware", "shellcode", "attack"])
+_SCAN_CATS = frozenset(["scan"])
+_ATTACK_CATS = _HIGH_SEVERITY_CATS | _SCAN_CATS | frozenset(["dos", "web_server", "web_client"])
 
-# Map of product keywords (lower-case) to what to look for in Suricata rule names.
-# Key = substring to search in nmap service product string.
-# Value = list of substrings that would appear in a matching Suricata rule name.
+
+def _rule_category(rule_name: str) -> str:
+    for prefix, cat in _CATEGORY_MAP:
+        if rule_name.startswith(prefix):
+            return cat
+    return "other"
+
+
+def _is_internal(ip: str, internal_prefixes: list[str]) -> bool:
+    return any(ip.startswith(p) for p in internal_prefixes)
+
+
+def _verdict_rank(v: str) -> int:
+    return {"NOISE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(v, 1)
+
+
+def _max_verdict(*verdicts: str) -> str:
+    return max(verdicts, key=_verdict_rank)
+
+
+# ── Alert × Alert pattern detection ──────────────────────────────────────────
+
+# Thresholds
+_LATERAL_DEST_MIN = 4  # distinct internal dest_ips from one src = lateral movement
+_PORT_SWEEP_MIN = 3  # same port on N distinct hosts = port sweep
+_MULTI_RULE_PAIR_MIN = 4  # distinct rules on same src→dest pair = sustained attack
+_HIGH_VOL_MIN = 30  # alerts from one src = high-volume flag
+_C2_RULE_MIN = 3  # distinct TROJAN/MALWARE rules on same pair = C2 pattern
+
+
+def _build_pattern(
+    pattern_type: str,
+    confidence: str,
+    pivot_ip: str,
+    pivot_role: str,
+    reason: str,
+    recommended_verdict: str,
+    rule_names: list[str],
+    categories: list[str],
+    alert_count: int,
+    time_first: str = "",
+    time_last: str = "",
+    dest_ips: list[str] | None = None,
+    dest_port: str = "",
+    peer_ip: str = "",
+) -> dict:
+    return {
+        "correlated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "alert_pattern",
+        "pattern_type": pattern_type,
+        "confidence": confidence,
+        "pivot_ip": pivot_ip,
+        "pivot_role": pivot_role,
+        "peer_ip": peer_ip,
+        "dest_ips": dest_ips or [],
+        "dest_port": dest_port,
+        "rule_names": sorted(set(rule_names))[:20],
+        "categories": sorted(set(categories)),
+        "alert_count": alert_count,
+        "time_first": time_first,
+        "time_last": time_last,
+        "recommended_verdict": recommended_verdict,
+        "confidence_rank": {"high": 0, "medium": 1, "low": 2}.get(confidence, 9),
+        "verdict_rank": _verdict_rank(recommended_verdict),
+        "reason": reason,
+    }
+
+
+def _correlate_alert_patterns(
+    entries: list[dict],
+    internal_prefixes: list[str],
+    log,
+) -> list[dict]:
+    """Detect behavioural patterns purely within the triage alert log."""
+
+    # Index structures
+    by_src: dict[str, list[dict]] = defaultdict(list)
+    by_dest: dict[str, list[dict]] = defaultdict(list)
+    by_pair: dict[tuple[str, str], list[dict]] = defaultdict(list)
+
+    for e in entries:
+        src = e.get("source_ip", "")
+        dst = e.get("dest_ip", "")
+        if src and src != "?":
+            by_src[src].append(e)
+        if dst and dst != "?":
+            by_dest[dst].append(e)
+        if src and dst and src != "?" and dst != "?":
+            by_pair[(src, dst)].append(e)
+
+    patterns: list[dict] = []
+
+    # ── Pattern 1: scan→exploit from same src ──────────────────────────
+    # src_ip fires scan-category rules AND exploit/trojan/malware/attack rules
+    for src_ip, src_entries in by_src.items():
+        cats = {_rule_category(e["rule_name"]) for e in src_entries}
+        has_scan = bool(cats & _SCAN_CATS)
+        has_high = bool(cats & _HIGH_SEVERITY_CATS)
+        if not (has_scan and has_high):
+            continue
+
+        scan_rules = [
+            e["rule_name"] for e in src_entries if _rule_category(e["rule_name"]) in _SCAN_CATS
+        ]
+        exploit_rules = [
+            e["rule_name"]
+            for e in src_entries
+            if _rule_category(e["rule_name"]) in _HIGH_SEVERITY_CATS
+        ]
+        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        dest_ips = sorted(
+            {e["dest_ip"] for e in src_entries if e.get("dest_ip") and e["dest_ip"] != "?"}
+        )
+
+        reason = (
+            f"{src_ip} fired SCAN rules ({len(set(scan_rules))} distinct) "
+            f"AND high-severity rules ({len(set(exploit_rules))} distinct: "
+            f"{', '.join(sorted(set(exploit_rules))[:3])}...) — classic attack chain"
+        )
+        log.info(
+            "  SCAN→EXPLOIT [src=%s]: %d scan + %d exploit rules, %d targets",
+            src_ip,
+            len(set(scan_rules)),
+            len(set(exploit_rules)),
+            len(dest_ips),
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="scan_to_exploit",
+                confidence="high",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                reason=reason,
+                recommended_verdict="HIGH",
+                rule_names=scan_rules + exploit_rules,
+                categories=sorted(cats & (_SCAN_CATS | _HIGH_SEVERITY_CATS)),
+                alert_count=len(src_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=dest_ips,
+            )
+        )
+
+    # ── Pattern 2: targeted host — same dest hit by scan + exploit ─────
+    for dest_ip, dest_entries in by_dest.items():
+        cats = {_rule_category(e["rule_name"]) for e in dest_entries}
+        has_scan = bool(cats & _SCAN_CATS)
+        has_high = bool(cats & _HIGH_SEVERITY_CATS)
+        if not (has_scan and has_high):
+            continue
+
+        src_ips = sorted(
+            {e["source_ip"] for e in dest_entries if e.get("source_ip") and e["source_ip"] != "?"}
+        )
+        rule_names = [e["rule_name"] for e in dest_entries]
+        times = sorted(e["alert_timestamp"] for e in dest_entries if e.get("alert_timestamp"))
+
+        reason = (
+            f"{dest_ip} was targeted by both SCAN and high-severity rules "
+            f"from {len(src_ips)} source(s) — host is being actively probed and attacked"
+        )
+        log.info("  TARGETED HOST [dest=%s]: scan+exploit from %d sources", dest_ip, len(src_ips))
+        patterns.append(
+            _build_pattern(
+                pattern_type="targeted_host",
+                confidence="high",
+                pivot_ip=dest_ip,
+                pivot_role="dest",
+                reason=reason,
+                recommended_verdict="HIGH",
+                rule_names=rule_names,
+                categories=sorted(cats & (_SCAN_CATS | _HIGH_SEVERITY_CATS)),
+                alert_count=len(dest_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=[dest_ip],
+            )
+        )
+
+    # ── Pattern 3: lateral movement — src reaching many internal dests ─
+    for src_ip, src_entries in by_src.items():
+        internal_dests = {
+            e["dest_ip"]
+            for e in src_entries
+            if e.get("dest_ip")
+            and e["dest_ip"] != "?"
+            and _is_internal(e["dest_ip"], internal_prefixes)
+        }
+        if len(internal_dests) < _LATERAL_DEST_MIN:
+            continue
+
+        rule_names = [e["rule_name"] for e in src_entries]
+        cats = {_rule_category(r) for r in rule_names}
+        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        src_internal = _is_internal(src_ip, internal_prefixes)
+        role_note = "internal source" if src_internal else "external source"
+
+        reason = (
+            f"{src_ip} ({role_note}) reached {len(internal_dests)} distinct internal hosts — "
+            f"possible {'lateral movement' if src_internal else 'external scan of internal network'}"
+        )
+        log.info("  LATERAL MOVEMENT [src=%s]: %d internal dests", src_ip, len(internal_dests))
+        patterns.append(
+            _build_pattern(
+                pattern_type="lateral_movement",
+                confidence="medium",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                reason=reason,
+                recommended_verdict="MEDIUM",
+                rule_names=rule_names,
+                categories=sorted(cats),
+                alert_count=len(src_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=sorted(internal_dests),
+            )
+        )
+
+    # ── Pattern 4: port sweep — same src, same port, many hosts ────────
+    # Group by (src_ip, dest_port) and count distinct dests
+    by_src_port: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for e in entries:
+        src = e.get("source_ip", "")
+        port = str(e.get("dest_port", ""))
+        if src and src != "?" and port and port != "?":
+            by_src_port[(src, port)].append(e)
+
+    for (src_ip, port), port_entries in by_src_port.items():
+        distinct_dests = {
+            e["dest_ip"] for e in port_entries if e.get("dest_ip") and e["dest_ip"] != "?"
+        }
+        if len(distinct_dests) < _PORT_SWEEP_MIN:
+            continue
+
+        rule_names = [e["rule_name"] for e in port_entries]
+        cats = {_rule_category(r) for r in rule_names}
+        times = sorted(e["alert_timestamp"] for e in port_entries if e.get("alert_timestamp"))
+
+        reason = (
+            f"{src_ip} hit port {port} on {len(distinct_dests)} distinct hosts "
+            f"({', '.join(sorted(distinct_dests)[:5])}{'...' if len(distinct_dests) > 5 else ''}) "
+            f"— service-specific sweep"
+        )
+        log.info("  PORT SWEEP [src=%s port=%s]: %d hosts", src_ip, port, len(distinct_dests))
+        patterns.append(
+            _build_pattern(
+                pattern_type="port_sweep",
+                confidence="medium",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                reason=reason,
+                recommended_verdict="MEDIUM",
+                rule_names=rule_names,
+                categories=sorted(cats),
+                alert_count=len(port_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=sorted(distinct_dests),
+                dest_port=port,
+            )
+        )
+
+    # ── Pattern 5: sustained multi-rule attack on same pair ─────────────
+    for (src_ip, dest_ip), pair_entries in by_pair.items():
+        distinct_rules = {e["rule_name"] for e in pair_entries}
+        if len(distinct_rules) < _MULTI_RULE_PAIR_MIN:
+            continue
+
+        cats = {_rule_category(r) for r in distinct_rules}
+        times = sorted(e["alert_timestamp"] for e in pair_entries if e.get("alert_timestamp"))
+
+        reason = (
+            f"{src_ip} → {dest_ip}: {len(distinct_rules)} distinct rules fired "
+            f"across {len(pair_entries)} alerts — sustained, varied activity on this connection"
+        )
+        log.info(
+            "  MULTI-RULE PAIR [%s→%s]: %d distinct rules", src_ip, dest_ip, len(distinct_rules)
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="multi_rule_pair",
+                confidence="medium",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                peer_ip=dest_ip,
+                reason=reason,
+                recommended_verdict=_max_verdict(
+                    "MEDIUM", *[e.get("verdict", "LOW") for e in pair_entries]
+                ),
+                rule_names=sorted(distinct_rules),
+                categories=sorted(cats),
+                alert_count=len(pair_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=[dest_ip],
+            )
+        )
+
+    # ── Pattern 6: C2 / beaconing — TROJAN/MALWARE rules on same pair ──
+    for (src_ip, dest_ip), pair_entries in by_pair.items():
+        c2_entries = [
+            e for e in pair_entries if _rule_category(e["rule_name"]) in ("trojan", "malware")
+        ]
+        distinct_c2_rules = {e["rule_name"] for e in c2_entries}
+        if len(distinct_c2_rules) < _C2_RULE_MIN:
+            continue
+
+        times = sorted(e["alert_timestamp"] for e in c2_entries if e.get("alert_timestamp"))
+        cats = {_rule_category(e["rule_name"]) for e in c2_entries}
+
+        reason = (
+            f"{src_ip} → {dest_ip}: {len(distinct_c2_rules)} distinct TROJAN/MALWARE rules "
+            f"across {len(c2_entries)} alerts — possible C2 channel or infected host"
+        )
+        log.info(
+            "  C2 BEACON [%s→%s]: %d trojan/malware rules", src_ip, dest_ip, len(distinct_c2_rules)
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="c2_beacon",
+                confidence="high",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                peer_ip=dest_ip,
+                reason=reason,
+                recommended_verdict="HIGH",
+                rule_names=sorted(distinct_c2_rules),
+                categories=sorted(cats),
+                alert_count=len(c2_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=[dest_ip],
+            )
+        )
+
+    # ── Pattern 7: high-volume single source ───────────────────────────
+    for src_ip, src_entries in by_src.items():
+        if len(src_entries) < _HIGH_VOL_MIN:
+            continue
+
+        distinct_rules = {e["rule_name"] for e in src_entries}
+        cats = {_rule_category(r) for r in distinct_rules}
+        # Skip if already caught by scan→exploit or lateral movement
+        already_flagged = any(
+            p["pivot_ip"] == src_ip and p["pattern_type"] in ("scan_to_exploit", "lateral_movement")
+            for p in patterns
+        )
+        if already_flagged:
+            continue
+
+        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        has_attack_cat = bool(cats & _ATTACK_CATS)
+
+        reason = (
+            f"{src_ip} generated {len(src_entries)} alerts with {len(distinct_rules)} distinct rules "
+            f"— {'includes attack-category rules' if has_attack_cat else 'high volume, review for false positives'}"
+        )
+        log.info(
+            "  HIGH VOLUME [src=%s]: %d alerts, %d rules",
+            src_ip,
+            len(src_entries),
+            len(distinct_rules),
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="high_volume_src",
+                confidence="medium" if has_attack_cat else "low",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                reason=reason,
+                recommended_verdict="MEDIUM" if has_attack_cat else "LOW",
+                rule_names=sorted(distinct_rules)[:20],
+                categories=sorted(cats),
+                alert_count=len(src_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+            )
+        )
+
+    # Sort: high confidence first, then by verdict rank
+    patterns.sort(key=lambda p: (p["confidence_rank"], p["verdict_rank"]))
+    log.info("Alert patterns found: %d", len(patterns))
+    return patterns
+
+
+# ── Vulnscan data loading ─────────────────────────────────────────────────────
+
 _SERVICE_KEYWORDS: list[tuple[str, list[str]]] = [
-    ("apache", ["Apache", "HTTP", "Log4j", "Tomcat", "Struts", "HTTP Server"]),
+    ("apache", ["Apache", "HTTP", "Log4j", "Tomcat", "Struts"]),
     ("openssh", ["SSH", "OpenSSH"]),
     ("microsoft-ds", ["SMB", "MS17-010", "EternalBlue", "SAMBA"]),
     ("netbios", ["SMB", "NetBIOS", "NTLM"]),
@@ -49,27 +443,12 @@ _SERVICE_KEYWORDS: list[tuple[str, list[str]]] = [
     ("smtp", ["SMTP", "Mail"]),
     ("iis", ["IIS", "HTTP"]),
     ("nginx", ["nginx", "HTTP"]),
-    ("phpmyadmin", ["phpMyAdmin", "PHP"]),
-    ("samba", ["Samba", "SMB", "SAMBA"]),
+    ("samba", ["Samba", "SMB"]),
     ("vnc", ["VNC"]),
     ("elasticsearch", ["Elasticsearch"]),
     ("redis", ["Redis"]),
     ("mongodb", ["MongoDB"]),
 ]
-
-# Rule categories that indicate an active exploit or attack attempt
-_EXPLOIT_CATEGORIES = frozenset(
-    [
-        "Attempted Administrator Privilege Gain",
-        "Attempted User Privilege Gain",
-        "Attempted Information Leak",
-        "Web Application Attack",
-        "Executable Code was Detected",
-        "Potential Corporate Privacy Violation",
-        "A Network Trojan was Detected",
-        "Misc Attack",
-    ]
-)
 
 _EXPLOIT_RULE_PREFIXES = (
     "ET EXPLOIT",
@@ -82,18 +461,31 @@ _EXPLOIT_RULE_PREFIXES = (
     "GPL ATTACK",
 )
 
+MATCH_EXACT_CVE = "exact_cve"
+MATCH_NUCLEI_CVE = "nuclei_cve"
+MATCH_SERVICE_KEYWORD = "service_keyword"
+MATCH_TARGETED_HOST = "targeted_host"
 
-# ── Vulnscan data loading ────────────────────────────────────────────────────
+_VULN_CONFIDENCE = {
+    MATCH_EXACT_CVE: "high",
+    MATCH_NUCLEI_CVE: "high",
+    MATCH_SERVICE_KEYWORD: "medium",
+    MATCH_TARGETED_HOST: "low",
+}
+_VULN_UPGRADES = {
+    MATCH_EXACT_CVE: "HIGH",
+    MATCH_NUCLEI_CVE: "HIGH",
+    MATCH_SERVICE_KEYWORD: "MEDIUM",
+    MATCH_TARGETED_HOST: "MEDIUM",
+}
 
 
 def _find_latest_file(directory: Path, glob: str) -> Path | None:
-    """Return the most recently modified file matching the glob, or None."""
     matches = sorted(directory.glob(glob), key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0] if matches else None
 
 
 def _load_nmap_index(xml_path: Path, log) -> dict[str, dict]:
-    """Parse nmap XML into {ip: {cves, services, hostname}}."""
     index: dict[str, dict] = {}
     try:
         tree = ET.parse(xml_path)
@@ -106,22 +498,18 @@ def _load_nmap_index(xml_path: Path, log) -> dict[str, dict]:
         status = host_elem.find("status")
         if status is not None and status.get("state") != "up":
             continue
-
         addr_elem = host_elem.find("address")
         if addr_elem is None:
             continue
         ip = addr_elem.get("addr", "")
 
         hostname = ""
-        hostnames_elem = host_elem.find("hostnames")
-        if hostnames_elem is not None:
-            hn = hostnames_elem.find("hostname")
-            if hn is not None:
-                hostname = hn.get("name", "")
+        hn_elem = host_elem.find("hostnames/hostname")
+        if hn_elem is not None:
+            hostname = hn_elem.get("name", "")
 
         cves: list[dict] = []
         services: list[str] = []
-
         ports_elem = host_elem.find("ports")
         if ports_elem is None:
             continue
@@ -130,45 +518,40 @@ def _load_nmap_index(xml_path: Path, log) -> dict[str, dict]:
             state_elem = port_elem.find("state")
             if state_elem is None or state_elem.get("state") != "open":
                 continue
-
             port_id = port_elem.get("portid", "?")
             protocol = port_elem.get("protocol", "tcp")
-            service_elem = port_elem.find("service")
-            service_name = service_elem.get("name", "") if service_elem is not None else ""
-            product = ""
-            if service_elem is not None:
-                prod = service_elem.get("product", "")
-                ver = service_elem.get("version", "")
-                product = f"{prod} {ver}".strip()
+            svc = port_elem.find("service")
+            svc_name = svc.get("name", "") if svc is not None else ""
+            product = (
+                f"{svc.get('product', '')} {svc.get('version', '')}".strip()
+                if svc is not None
+                else ""
+            )
+            services.append(f"{port_id}/{protocol} {svc_name} {product}".strip())
 
-            services.append(f"{port_id}/{protocol} {service_name} {product}".strip())
-
-            for script_elem in port_elem.findall("script"):
-                if script_elem.get("id") != "vulners":
+            for script in port_elem.findall("script"):
+                if script.get("id") != "vulners":
                     continue
-                output = script_elem.get("output", "")
-                for line in output.split("\n"):
-                    line = line.strip()
-                    m = re.match(r"(CVE-\d{4}-\d+)\s+(\d+\.?\d*)", line)
+                for line in script.get("output", "").split("\n"):
+                    m = re.match(r"(CVE-\d{4}-\d+)\s+(\d+\.?\d*)", line.strip())
                     if m:
                         cves.append(
                             {
                                 "cve": m.group(1),
                                 "cvss": float(m.group(2)),
                                 "port": f"{port_id}/{protocol}",
-                                "service": product or service_name,
+                                "service": product or svc_name,
                             }
                         )
 
         cves.sort(key=lambda v: v["cvss"], reverse=True)
         index[ip] = {"hostname": hostname, "cves": cves, "services": services}
 
-    log.info("nmap index: %d hosts loaded from %s", len(index), xml_path.name)
+    log.info("nmap index: %d hosts from %s", len(index), xml_path.name)
     return index
 
 
 def _load_nuclei_index(jsonl_path: Path, log) -> dict[str, list[dict]]:
-    """Parse nuclei JSONL into {ip: [findings]}."""
     index: dict[str, list[dict]] = {}
     try:
         lines = jsonl_path.read_text(encoding="utf-8").strip().split("\n")
@@ -183,320 +566,88 @@ def _load_nuclei_index(jsonl_path: Path, log) -> dict[str, list[dict]]:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-
-        host_url = entry.get("host", "")
-        # Extract bare IP from "https://1.2.3.4:443" etc.
-        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", host_url)
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", entry.get("host", ""))
         if not m:
             continue
         ip = m.group(1)
-
         cve_ids = entry.get("info", {}).get("classification", {}).get("cve-id", []) or []
-        finding = {
-            "template_id": entry.get("template-id", ""),
-            "name": entry.get("info", {}).get("name", ""),
-            "severity": entry.get("info", {}).get("severity", ""),
-            "matched_at": entry.get("matched-at", ""),
-            "cve_ids": cve_ids,
-        }
-        index.setdefault(ip, []).append(finding)
+        index.setdefault(ip, []).append(
+            {
+                "template_id": entry.get("template-id", ""),
+                "name": entry.get("info", {}).get("name", ""),
+                "severity": entry.get("info", {}).get("severity", ""),
+                "matched_at": entry.get("matched-at", ""),
+                "cve_ids": cve_ids,
+            }
+        )
 
-    log.info("nuclei index: %d hosts with findings from %s", len(index), jsonl_path.name)
+    log.info("nuclei index: %d hosts from %s", len(index), jsonl_path.name)
     return index
 
 
-# ── CVE and service matching ─────────────────────────────────────────────────
+# ── Alert × Vulnscan correlation ─────────────────────────────────────────────
 
 
 def _cves_in_rule(rule_name: str) -> list[str]:
-    """Extract CVE IDs mentioned in a Suricata rule name."""
     return re.findall(r"CVE-\d{4}-\d+", rule_name, re.IGNORECASE)
 
 
-def _is_exploit_rule(rule_name: str, category: str = "") -> bool:
-    """True if the rule looks like an active exploit/attack attempt."""
-    if any(rule_name.startswith(p) for p in _EXPLOIT_RULE_PREFIXES):
-        return True
-    if category in _EXPLOIT_CATEGORIES:
-        return True
-    return False
+def _is_exploit_rule(rule_name: str) -> bool:
+    return any(rule_name.startswith(p) for p in _EXPLOIT_RULE_PREFIXES)
 
 
-def _service_keywords_match(rule_name: str, services: list[str]) -> list[str]:
-    """Return matched service strings where rule mentions a product found on this host."""
+def _svc_keywords_match(rule_name: str, services: list[str]) -> list[str]:
     matches = []
-    services_lower = " ".join(services).lower()
+    svcs_lower = " ".join(services).lower()
     rule_lower = rule_name.lower()
-    for svc_key, rule_terms in _SERVICE_KEYWORDS:
-        if svc_key not in services_lower:
+    for svc_key, terms in _SERVICE_KEYWORDS:
+        if svc_key not in svcs_lower:
             continue
-        for term in rule_terms:
+        for term in terms:
             if term.lower() in rule_lower:
-                # Find the specific service entry that matched
                 for svc in services:
-                    if svc_key in svc.lower():
-                        if svc not in matches:
-                            matches.append(svc)
+                    if svc_key in svc.lower() and svc not in matches:
+                        matches.append(svc)
                         break
     return matches
 
 
-def _recommend_verdict(match_type: str, current_verdict: str) -> str:
-    """Recommend a new verdict based on match type; never lower than current."""
-    order = {"NOISE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
-    upgrades = {
-        MATCH_EXACT_CVE: "HIGH",
-        MATCH_NUCLEI_CVE: "HIGH",
-        MATCH_SERVICE_KEYWORD: "MEDIUM",
-        MATCH_TARGETED_HOST: "MEDIUM",
-    }
-    target = upgrades.get(match_type, current_verdict)
-    current_n = order.get(current_verdict, 1)
-    target_n = order.get(target, 1)
-    return target if target_n > current_n else current_verdict
+def _vuln_recommend(match_type: str, current: str) -> str:
+    target = _VULN_UPGRADES.get(match_type, current)
+    return target if _verdict_rank(target) > _verdict_rank(current) else current
 
 
-# ── Core correlation ──────────────────────────────────────────────────────────
-
-
-def _correlate_one_ip(
+def _build_vuln_finding(
     entry: dict,
-    ip: str,
-    direction: str,
-    nmap_index: dict[str, dict],
-    nuclei_index: dict[str, list[dict]],
-    log,
-) -> list[dict]:
-    """Try to correlate a single IP (src or dest) against scan results.
-
-    direction is 'inbound' (ip is dest — attacker targeting this host) or
-    'outbound' (ip is src — this internal host is doing something suspicious).
-    """
-    rule_name = entry.get("rule_name", "")
-    verdict = entry.get("verdict", "LOW")
-
-    host_info = nmap_index.get(ip)
-    nuclei_findings = nuclei_index.get(ip, [])
-
-    if not host_info and not nuclei_findings:
-        return []
-
-    role = "source host" if direction == "outbound" else "destination host"
-    rule_cves = _cves_in_rule(rule_name)
-    host_cves = {c["cve"].upper(): c for c in (host_info["cves"] if host_info else [])}
-    host_services = host_info["services"] if host_info else []
-    matched = False
-    findings: list[dict] = []
-
-    # Tier 1 — exact CVE match
-    for cve in rule_cves:
-        if cve.upper() in host_cves:
-            scan_cve = host_cves[cve.upper()]
-            reason = (
-                f"Rule references {cve} which vulnscan confirmed on "
-                f"{ip}:{scan_cve['port']} ({scan_cve['service']}, CVSS {scan_cve['cvss']}) "
-                f"[{role}]"
-            )
-            findings.append(
-                _build_finding(
-                    entry,
-                    ip,
-                    direction,
-                    host_info,
-                    MATCH_EXACT_CVE,
-                    verdict,
-                    reason,
-                    matched_cves=[cve],
-                    scan_cve_detail=scan_cve,
-                )
-            )
-            matched = True
-            log.info(
-                "  EXACT CVE [%s]: %s → %s on %s (CVSS %.1f)",
-                direction,
-                rule_name[:55],
-                cve,
-                ip,
-                scan_cve["cvss"],
-            )
-
-    # Tier 2 — nuclei CVE match
-    for nf in nuclei_findings:
-        overlap = set(cve.upper() for cve in rule_cves) & set(c.upper() for c in nf["cve_ids"])
-        if overlap:
-            reason = (
-                f"Rule references {', '.join(overlap)} and nuclei confirmed "
-                f"'{nf['name']}' at {nf['matched_at']} (severity: {nf['severity']}) [{role}]"
-            )
-            findings.append(
-                _build_finding(
-                    entry,
-                    ip,
-                    direction,
-                    host_info,
-                    MATCH_NUCLEI_CVE,
-                    verdict,
-                    reason,
-                    matched_cves=list(overlap),
-                    nuclei_finding=nf,
-                )
-            )
-            matched = True
-            log.info(
-                "  NUCLEI CVE [%s]: %s → %s on %s",
-                direction,
-                rule_name[:55],
-                ", ".join(overlap),
-                ip,
-            )
-            continue
-
-        if nf["severity"] in ("critical", "high") and not matched and _is_exploit_rule(rule_name):
-            reason = (
-                f"Exploit rule involving {ip} where nuclei confirmed "
-                f"'{nf['name']}' ({nf['severity']}) at {nf['matched_at']} [{role}]"
-            )
-            findings.append(
-                _build_finding(
-                    entry,
-                    ip,
-                    direction,
-                    host_info,
-                    MATCH_NUCLEI_CVE,
-                    verdict,
-                    reason,
-                    nuclei_finding=nf,
-                )
-            )
-            matched = True
-            log.info("  NUCLEI HOST [%s]: %s → %s on %s", direction, rule_name[:55], nf["name"], ip)
-
-    # Tier 3 — service keyword match
-    if not matched and host_services:
-        svc_matches = _service_keywords_match(rule_name, host_services)
-        if svc_matches:
-            reason = (
-                f"Rule mentions product also found open on {ip} ({role}): "
-                f"{', '.join(svc_matches[:3])}"
-            )
-            findings.append(
-                _build_finding(
-                    entry,
-                    ip,
-                    direction,
-                    host_info,
-                    MATCH_SERVICE_KEYWORD,
-                    verdict,
-                    reason,
-                    matched_services=svc_matches,
-                )
-            )
-            matched = True
-            log.info("  SERVICE [%s]: %s → %s on %s", direction, rule_name[:55], svc_matches[0], ip)
-
-    # Tier 4 — host involved in exploit/attack rule and has known CVEs
-    if not matched and host_info and host_info["cves"] and _is_exploit_rule(rule_name):
-        top_cve = host_info["cves"][0]
-        reason = (
-            f"Exploit/attack rule involving {ip} ({role}), which has "
-            f"{len(host_info['cves'])} known CVEs (highest: {top_cve['cve']} "
-            f"CVSS {top_cve['cvss']})"
-        )
-        findings.append(
-            _build_finding(
-                entry,
-                ip,
-                direction,
-                host_info,
-                MATCH_TARGETED_HOST,
-                verdict,
-                reason,
-            )
-        )
-        log.info(
-            "  TARGETED HOST [%s]: %s → %s (%d CVEs)",
-            direction,
-            rule_name[:55],
-            ip,
-            len(host_info["cves"]),
-        )
-
-    return findings
-
-
-def _correlate(
-    triage_entries: list[dict],
-    nmap_index: dict[str, dict],
-    nuclei_index: dict[str, list[dict]],
-    log,
-) -> list[dict]:
-    """Return a list of correlation findings sorted by confidence (high first)."""
-    findings: list[dict] = []
-    seen: set[tuple] = set()  # deduplicate on (alert_id, ip, match_type)
-
-    for entry in triage_entries:
-        src_ip = entry.get("source_ip", "")
-        dest_ip = entry.get("dest_ip", "")
-        rule_name = entry.get("rule_name", "")
-
-        # Check dest_ip (inbound: attacker → internal victim)
-        if dest_ip and dest_ip != "?":
-            for f in _correlate_one_ip(entry, dest_ip, "inbound", nmap_index, nuclei_index, log):
-                key = (f["alert_id"], dest_ip, f["match_type"])
-                if key not in seen:
-                    seen.add(key)
-                    findings.append(f)
-
-        # Check src_ip (outbound: internal host doing something suspicious)
-        if src_ip and src_ip != "?" and src_ip != dest_ip:
-            for f in _correlate_one_ip(entry, src_ip, "outbound", nmap_index, nuclei_index, log):
-                key = (f["alert_id"], src_ip, f["match_type"])
-                if key not in seen:
-                    seen.add(key)
-                    findings.append(f)
-
-    # Sort: high confidence first, then by recommended verdict severity
-    order_conf = {"high": 0, "medium": 1, "low": 2}
-    order_verd = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "NOISE": 3}
-    findings.sort(
-        key=lambda f: (
-            order_conf.get(f["confidence"], 9),
-            order_verd.get(f["recommended_verdict"], 9),
-        )
-    )
-    return findings
-
-
-def _build_finding(
-    triage_entry: dict,
     matched_ip: str,
     direction: str,
     host_info: dict | None,
     match_type: str,
-    current_verdict: str,
     reason: str,
     matched_cves: list[str] | None = None,
     matched_services: list[str] | None = None,
     scan_cve_detail: dict | None = None,
     nuclei_finding: dict | None = None,
 ) -> dict:
-    recommended = _recommend_verdict(match_type, current_verdict)
+    current = entry.get("verdict", "LOW")
+    recommended = _vuln_recommend(match_type, current)
     return {
         "correlated_at": datetime.now(timezone.utc).isoformat(),
-        "alert_id": triage_entry.get("alert_id", ""),
-        "alert_timestamp": triage_entry.get("alert_timestamp", ""),
-        "rule_name": triage_entry.get("rule_name", ""),
-        "source_ip": triage_entry.get("source_ip", ""),
-        "dest_ip": triage_entry.get("dest_ip", ""),
-        "dest_port": triage_entry.get("dest_port", ""),
+        "source": "vuln_correlation",
+        "alert_id": entry.get("alert_id", ""),
+        "alert_timestamp": entry.get("alert_timestamp", ""),
+        "rule_name": entry.get("rule_name", ""),
+        "source_ip": entry.get("source_ip", ""),
+        "dest_ip": entry.get("dest_ip", ""),
+        "dest_port": entry.get("dest_port", ""),
         "matched_ip": matched_ip,
         "direction": direction,
-        "triage_verdict": current_verdict,
-        "triage_method": triage_entry.get("method", ""),
+        "triage_verdict": current,
+        "triage_method": entry.get("method", ""),
         "match_type": match_type,
-        "confidence": CONFIDENCE[match_type],
+        "confidence": _VULN_CONFIDENCE[match_type],
         "recommended_verdict": recommended,
-        "verdict_changed": recommended != current_verdict,
+        "verdict_changed": recommended != current,
         "reason": reason,
         "matched_cves": matched_cves or [],
         "matched_services": matched_services or [],
@@ -508,11 +659,177 @@ def _build_finding(
     }
 
 
-# ── Report ───────────────────────────────────────────────────────────────────
+def _correlate_one_ip_vuln(
+    entry: dict,
+    ip: str,
+    direction: str,
+    nmap_index: dict[str, dict],
+    nuclei_index: dict[str, list[dict]],
+    log,
+) -> list[dict]:
+    rule_name = entry.get("rule_name", "")
+    host_info = nmap_index.get(ip)
+    nuclei_findings = nuclei_index.get(ip, [])
+    if not host_info and not nuclei_findings:
+        return []
+
+    role = "source host" if direction == "outbound" else "destination host"
+    rule_cves = _cves_in_rule(rule_name)
+    host_cves = {c["cve"].upper(): c for c in (host_info["cves"] if host_info else [])}
+    host_services = host_info["services"] if host_info else []
+    matched = False
+    results: list[dict] = []
+
+    for cve in rule_cves:
+        if cve.upper() in host_cves:
+            sc = host_cves[cve.upper()]
+            reason = (
+                f"Rule references {cve} confirmed by vulnscan on "
+                f"{ip}:{sc['port']} ({sc['service']}, CVSS {sc['cvss']}) [{role}]"
+            )
+            results.append(
+                _build_vuln_finding(
+                    entry,
+                    ip,
+                    direction,
+                    host_info,
+                    MATCH_EXACT_CVE,
+                    reason,
+                    matched_cves=[cve],
+                    scan_cve_detail=sc,
+                )
+            )
+            matched = True
+            log.info(
+                "  EXACT CVE [%s]: %s → %s on %s (CVSS %.1f)",
+                direction,
+                rule_name[:50],
+                cve,
+                ip,
+                sc["cvss"],
+            )
+
+    for nf in nuclei_findings:
+        overlap = set(c.upper() for c in rule_cves) & set(c.upper() for c in nf["cve_ids"])
+        if overlap:
+            reason = (
+                f"Rule references {', '.join(overlap)} and nuclei confirmed "
+                f"'{nf['name']}' at {nf['matched_at']} ({nf['severity']}) [{role}]"
+            )
+            results.append(
+                _build_vuln_finding(
+                    entry,
+                    ip,
+                    direction,
+                    host_info,
+                    MATCH_NUCLEI_CVE,
+                    reason,
+                    matched_cves=list(overlap),
+                    nuclei_finding=nf,
+                )
+            )
+            matched = True
+            continue
+        if nf["severity"] in ("critical", "high") and not matched and _is_exploit_rule(rule_name):
+            reason = (
+                f"Exploit rule involving {ip} where nuclei confirmed "
+                f"'{nf['name']}' ({nf['severity']}) at {nf['matched_at']} [{role}]"
+            )
+            results.append(
+                _build_vuln_finding(
+                    entry,
+                    ip,
+                    direction,
+                    host_info,
+                    MATCH_NUCLEI_CVE,
+                    reason,
+                    nuclei_finding=nf,
+                )
+            )
+            matched = True
+
+    if not matched and host_services:
+        svc_matches = _svc_keywords_match(rule_name, host_services)
+        if svc_matches:
+            reason = (
+                f"Rule mentions product found open on {ip} ({role}): {', '.join(svc_matches[:3])}"
+            )
+            results.append(
+                _build_vuln_finding(
+                    entry,
+                    ip,
+                    direction,
+                    host_info,
+                    MATCH_SERVICE_KEYWORD,
+                    reason,
+                    matched_services=svc_matches,
+                )
+            )
+            matched = True
+
+    if not matched and host_info and host_info["cves"] and _is_exploit_rule(rule_name):
+        top = host_info["cves"][0]
+        reason = (
+            f"Exploit rule involving {ip} ({role}) which has {len(host_info['cves'])} known CVEs "
+            f"(highest: {top['cve']} CVSS {top['cvss']})"
+        )
+        results.append(
+            _build_vuln_finding(
+                entry,
+                ip,
+                direction,
+                host_info,
+                MATCH_TARGETED_HOST,
+                reason,
+            )
+        )
+
+    return results
+
+
+def _correlate_vuln(
+    entries: list[dict],
+    nmap_index: dict[str, dict],
+    nuclei_index: dict[str, list[dict]],
+    log,
+) -> list[dict]:
+    findings: list[dict] = []
+    seen: set[tuple] = set()
+
+    for entry in entries:
+        src = entry.get("source_ip", "")
+        dst = entry.get("dest_ip", "")
+
+        if dst and dst != "?":
+            for f in _correlate_one_ip_vuln(entry, dst, "inbound", nmap_index, nuclei_index, log):
+                key = (f["alert_id"], dst, f["match_type"])
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(f)
+
+        if src and src != "?" and src != dst:
+            for f in _correlate_one_ip_vuln(entry, src, "outbound", nmap_index, nuclei_index, log):
+                key = (f["alert_id"], src, f["match_type"])
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(f)
+
+    order_conf = {"high": 0, "medium": 1, "low": 2}
+    findings.sort(
+        key=lambda f: (
+            order_conf.get(f["confidence"], 9),
+            -_verdict_rank(f["recommended_verdict"]),
+        )
+    )
+    return findings
+
+
+# ── Report ────────────────────────────────────────────────────────────────────
 
 
 def _build_report(
-    findings: list[dict],
+    patterns: list[dict],
+    vuln_findings: list[dict],
     triage_count: int,
     nmap_hosts: int,
     nuclei_hosts: int,
@@ -521,107 +838,136 @@ def _build_report(
     nuclei_file: str,
     run_time: str,
 ) -> str:
-    high_conf = [f for f in findings if f["confidence"] == "high"]
-    med_conf = [f for f in findings if f["confidence"] == "medium"]
-    low_conf = [f for f in findings if f["confidence"] == "low"]
-    verdict_changes = [f for f in findings if f["verdict_changed"]]
+    high_p = [p for p in patterns if p["confidence"] == "high"]
+    med_p = [p for p in patterns if p["confidence"] == "medium"]
+    low_p = [p for p in patterns if p["confidence"] == "low"]
+    high_v = [f for f in vuln_findings if f["confidence"] == "high"]
+    med_v = [f for f in vuln_findings if f["confidence"] == "medium"]
+    low_v = [f for f in vuln_findings if f["confidence"] == "low"]
+    verdict_changes = [f for f in vuln_findings if f["verdict_changed"]]
 
     lines = [
-        "# Alert-Vulnscan Correlation Report",
+        "# Alert Correlation Report",
         f"**Run:** {run_time}",
-        f"**Triage alerts checked:** {triage_count} (last {lookback_hours}h)",
-        f"**Vulnscan hosts:** {nmap_hosts} (nmap) / {nuclei_hosts} (nuclei)",
-        f"**Nmap source:** {nmap_file}",
-        f"**Nuclei source:** {nuclei_file}",
+        f"**Triage alerts:** {triage_count} (last {lookback_hours}h)",
+        f"**Vulnscan hosts:** {nmap_hosts} nmap / {nuclei_hosts} nuclei",
+        f"**Nmap source:** {nmap_file}  |  **Nuclei source:** {nuclei_file}",
         "",
         "## Summary",
-        f"- Total correlations found: **{len(findings)}**",
-        f"  - High confidence: {len(high_conf)} (exact CVE or nuclei-confirmed match)",
-        f"  - Medium confidence: {len(med_conf)} (service/product keyword match)",
-        f"  - Low confidence: {len(low_conf)} (exploit rule targeting vulnerable host)",
-        f"- Verdict upgrades recommended: **{len(verdict_changes)}**",
+        "",
+        f"### Alert Patterns (alert × alert) — {len(patterns)} patterns",
+        f"  - High confidence: {len(high_p)}",
+        f"  - Medium confidence: {len(med_p)}",
+        f"  - Low confidence: {len(low_p)}",
+        "",
+        f"### Vuln Correlations (alert × scan) — {len(vuln_findings)} findings",
+        f"  - High confidence: {len(high_v)}",
+        f"  - Medium confidence: {len(med_v)}",
+        f"  - Low confidence: {len(low_v)}",
+        f"  - Verdict upgrades recommended: {len(verdict_changes)}",
         "",
     ]
 
-    if not findings:
-        lines.append("No correlations found between triage alerts and scan results.")
-        lines.append("")
-        lines.append("This means either:")
-        lines.append("  - No triage alerts targeted hosts found in the vulnerability scan")
-        lines.append("  - The scan results and alert window do not overlap")
-        lines.append("  - All alerts targeted external IPs not in the scan scope")
-        return "\n".join(lines)
+    # ── Alert patterns ─────────────────────────────────────────────────
+    if patterns:
+        lines += ["---", "# Alert Behaviour Patterns", ""]
+        _pattern_labels = {
+            "scan_to_exploit": "SCAN→EXPLOIT chain",
+            "targeted_host": "Host targeted (scan + exploit)",
+            "lateral_movement": "Lateral movement / internal sweep",
+            "port_sweep": "Port sweep (same port, many hosts)",
+            "multi_rule_pair": "Sustained multi-rule attack (same pair)",
+            "c2_beacon": "C2 / beaconing (TROJAN/MALWARE rules)",
+            "high_volume_src": "High-volume source",
+        }
 
-    if verdict_changes:
-        lines.append("## Recommended Verdict Upgrades")
-        lines.append("")
-        for f in verdict_changes:
-            lines.append(
-                f"- **{f['rule_name'][:70]}**  "
-                f"`{f['triage_verdict']} → {f['recommended_verdict']}`  "
-                f"[{f['confidence']} confidence]"
-            )
-            lines.append(f"  - `{f['matched_ip']}` ({f['direction']}) | Match: `{f['match_type']}`")
-            lines.append(f"  - {f['reason']}")
+        for p in high_p + med_p + low_p:
+            label = _pattern_labels.get(p["pattern_type"], p["pattern_type"])
+            lines.append(f"## [{p['confidence'].upper()}] {label}")
+            lines.append(f"- **Pivot IP:** `{p['pivot_ip']}` (as {p['pivot_role']})")
+            if p["peer_ip"]:
+                lines.append(f"- **Peer IP:** `{p['peer_ip']}`")
+            if p["dest_ips"] and p["dest_ips"] != [p["pivot_ip"]]:
+                shown = p["dest_ips"][:8]
+                more = f" +{len(p['dest_ips']) - 8} more" if len(p["dest_ips"]) > 8 else ""
+                lines.append(f"- **Involved hosts:** {', '.join(f'`{ip}`' for ip in shown)}{more}")
+            if p["dest_port"]:
+                lines.append(f"- **Port:** {p['dest_port']}")
+            lines.append(f"- **Recommended verdict:** {p['recommended_verdict']}")
+            lines.append(f"- **Alert count:** {p['alert_count']}")
+            if p["time_first"] and p["time_last"]:
+                lines.append(f"- **Window:** {p['time_first'][:19]} → {p['time_last'][:19]}")
+            lines.append(f"- **Categories:** {', '.join(p['categories'])}")
+            lines.append(f"- **Rules ({len(p['rule_names'])}):**")
+            for r in p["rule_names"][:10]:
+                lines.append(f"  - {r}")
+            if len(p["rule_names"]) > 10:
+                lines.append(f"  - *(+{len(p['rule_names']) - 10} more)*")
+            lines.append(f"- **Reason:** {p['reason']}")
             lines.append("")
 
-    if high_conf:
-        lines.append("## High Confidence Correlations")
-        lines.append("")
-        for f in high_conf:
-            hostname = f" ({f['host_hostname']})" if f["host_hostname"] else ""
-            lines.append(f"### {f['rule_name'][:80]}")
-            lines.append(
-                f"- **Alert:** `{f['alert_timestamp']}` | "
-                f"{f['source_ip']} → {f['dest_ip']}:{f['dest_port']}"
-            )
-            lines.append(f"- **Matched host:** `{f['matched_ip']}`{hostname} ({f['direction']})")
-            lines.append(
-                f"- **Triage verdict:** {f['triage_verdict']} (method: {f['triage_method']})"
-            )
-            lines.append(f"- **Recommended:** {f['recommended_verdict']}")
-            lines.append(f"- **Match:** {f['match_type']} — {f['reason']}")
-            if f["matched_cves"]:
-                lines.append(f"- **CVEs:** {', '.join(f['matched_cves'])}")
-            if f["scan_cve_detail"]:
-                d = f["scan_cve_detail"]
+    # ── Vuln correlations ──────────────────────────────────────────────
+    if vuln_findings:
+        lines += ["---", "# Vulnerability Correlations", ""]
+
+        if verdict_changes:
+            lines += ["## Recommended Verdict Upgrades", ""]
+            for f in verdict_changes:
                 lines.append(
-                    f"- **Scan detail:** {d['cve']} CVSS {d['cvss']} on "
-                    f"{f['matched_ip']}:{d['port']} ({d['service']})"
+                    f"- **{f['rule_name'][:70]}**  "
+                    f"`{f['triage_verdict']} → {f['recommended_verdict']}`  "
+                    f"[{f['confidence']}]"
                 )
-            if f["nuclei_finding"]:
-                nf = f["nuclei_finding"]
-                lines.append(f"- **Nuclei:** {nf['name']} ({nf['severity']}) at {nf['matched_at']}")
-            lines.append("")
+                lines.append(f"  - `{f['matched_ip']}` ({f['direction']}) | `{f['match_type']}`")
+                lines.append(f"  - {f['reason']}")
+                lines.append("")
 
-    if med_conf:
-        lines.append("## Medium Confidence Correlations")
-        lines.append("")
-        for f in med_conf:
-            lines.append(
-                f"- **{f['rule_name'][:70]}** → `{f['matched_ip']}` ({f['direction']}) | "
-                f"{f['triage_verdict']}→{f['recommended_verdict']} | {f['reason']}"
-            )
-        lines.append("")
+        for conf_label, conf_list in [("High", high_v), ("Medium", med_v), ("Low", low_v)]:
+            if not conf_list:
+                continue
+            lines += [f"## {conf_label} Confidence Vuln Correlations", ""]
+            for f in conf_list:
+                hn = f" ({f['host_hostname']})" if f["host_hostname"] else ""
+                lines.append(f"### {f['rule_name'][:80]}")
+                lines.append(
+                    f"- **Alert:** `{f['alert_timestamp'][:19]}` | {f['source_ip']} → {f['dest_ip']}:{f['dest_port']}"
+                )
+                lines.append(f"- **Matched host:** `{f['matched_ip']}`{hn} ({f['direction']})")
+                lines.append(
+                    f"- **Verdict:** {f['triage_verdict']} → **{f['recommended_verdict']}** ({f['match_type']})"
+                )
+                lines.append(f"- {f['reason']}")
+                if f["matched_cves"]:
+                    lines.append(f"- **CVEs:** {', '.join(f['matched_cves'])}")
+                if f["scan_cve_detail"]:
+                    d = f["scan_cve_detail"]
+                    lines.append(
+                        f"- **Scan:** {d['cve']} CVSS {d['cvss']} on {f['matched_ip']}:{d['port']} ({d['service']})"
+                    )
+                if f["nuclei_finding"]:
+                    nf = f["nuclei_finding"]
+                    lines.append(
+                        f"- **Nuclei:** {nf['name']} ({nf['severity']}) at {nf['matched_at']}"
+                    )
+                lines.append("")
 
-    if low_conf:
-        lines.append("## Low Confidence Correlations")
-        lines.append("")
-        for f in low_conf:
-            lines.append(
-                f"- **{f['rule_name'][:70]}** → `{f['matched_ip']}` ({f['direction']}, "
-                f"{f['host_cve_count']} CVEs, top CVSS {f['host_top_cvss']}) | {f['triage_verdict']}"
-            )
-        lines.append("")
+    if not patterns and not vuln_findings:
+        lines += [
+            "No correlations found.",
+            "",
+            "Possible reasons:",
+            "  - Alert IPs do not overlap with scanned hosts",
+            "  - No attack-chain patterns in the alert window",
+            "  - All alerts are single-category INFO traffic",
+        ]
 
     return "\n".join(lines)
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def run_correlate(cfg: Config, lookback_hours: int = 48):
-    """Cross-reference recent triage alerts with the latest vulnscan results."""
     data_dir = cfg.paths.data_dir
     log_dir = data_dir / "logs"
     state_dir = data_dir / "state"
@@ -638,110 +984,101 @@ def run_correlate(cfg: Config, lookback_hours: int = 48):
     log.info("=== Starting correlation run: %s ===", run_time)
     log.info("Triage lookback: %dh", lookback_hours)
 
-    # ── Load triage alerts ────────────────────────────────────────────
+    # ── Load triage log ───────────────────────────────────────────────
     triage_jsonl = log_dir / "triage.jsonl"
-    triage_entries: list[dict] = []
+    entries: list[dict] = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
     if not triage_jsonl.exists():
-        log.warning("No triage log found at %s — run 'so-ops triage' first", triage_jsonl)
-        print(f"No triage log found. Run 'so-ops triage' first.\nExpected:  {triage_jsonl}")
+        log.warning("No triage log at %s — run 'so-ops triage' first", triage_jsonl)
+        print(f"No triage log found. Run 'so-ops triage' first.\nExpected: {triage_jsonl}")
         state.finish_run(correlations=0)
         return
 
-    total_triage = 0
-    skipped_old = 0
+    total = skipped = 0
     for line in triage_jsonl.read_text(encoding="utf-8").strip().split("\n"):
         if not line.strip():
             continue
         try:
-            entry = json.loads(line)
+            e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        total_triage += 1
-        ts_str = entry.get("alert_timestamp", "")
+        total += 1
+        ts_str = e.get("alert_timestamp", "")
         try:
             ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
             if ts < cutoff:
-                skipped_old += 1
+                skipped += 1
                 continue
         except (ValueError, TypeError):
             pass
-        triage_entries.append(entry)
+        entries.append(e)
 
+    log.info("Triage log: %d total, %d in window, %d skipped", total, len(entries), skipped)
+
+    if not entries:
+        log.warning("No alerts in last %dh", lookback_hours)
+        print(f"No triage alerts in the last {lookback_hours}h.")
+        state.finish_run(correlations=0)
+        return
+
+    # ── Pass 1: alert × alert patterns ───────────────────────────────
+    log.info("=== Pass 1: alert pattern detection (%d alerts) ===", len(entries))
+    patterns = _correlate_alert_patterns(entries, cfg.network.internal_prefixes, log)
     log.info(
-        "Triage log: %d total entries, %d within %dh lookback, %d older (skipped)",
-        total_triage,
-        len(triage_entries),
-        lookback_hours,
-        skipped_old,
+        "Patterns: %d total (%d high, %d medium, %d low)",
+        len(patterns),
+        sum(1 for p in patterns if p["confidence"] == "high"),
+        sum(1 for p in patterns if p["confidence"] == "medium"),
+        sum(1 for p in patterns if p["confidence"] == "low"),
     )
 
-    if not triage_entries:
-        log.warning("No triage alerts in the last %dh. Nothing to correlate.", lookback_hours)
-        print(f"No triage alerts found in the last {lookback_hours}h.")
-        state.finish_run(correlations=0)
-        return
-
-    # ── Load vulnscan results ─────────────────────────────────────────
-    if not scan_dir.exists():
-        log.warning("No vulnscan output directory found at %s — run 'so-ops scan' first", scan_dir)
-        print(f"No scan results found. Run 'so-ops scan' first.\nExpected: {scan_dir}")
-        state.finish_run(correlations=0)
-        return
-
-    nmap_xml = _find_latest_file(scan_dir, "nmap_*.xml")
-    nuclei_jsonl = _find_latest_file(scan_dir, "nuclei_*.jsonl")
-
+    # ── Pass 2: alert × vulnscan ──────────────────────────────────────
     nmap_index: dict[str, dict] = {}
     nuclei_index: dict[str, list[dict]] = {}
+    nmap_xml = nuclei_jsonl = None
 
-    if nmap_xml:
-        log.info("Loading nmap results: %s", nmap_xml.name)
-        nmap_index = _load_nmap_index(nmap_xml, log)
+    if scan_dir.exists():
+        nmap_xml = _find_latest_file(scan_dir, "nmap_*.xml")
+        nuclei_jsonl = _find_latest_file(scan_dir, "nuclei_*.jsonl")
+        if nmap_xml:
+            nmap_index = _load_nmap_index(nmap_xml, log)
+        if nuclei_jsonl:
+            nuclei_index = _load_nuclei_index(nuclei_jsonl, log)
     else:
-        log.warning("No nmap XML found in %s — only nuclei results will be used", scan_dir)
+        log.info("No vulnscan output dir — skipping vuln correlation (run 'so-ops scan' first)")
 
-    if nuclei_jsonl:
-        log.info("Loading nuclei results: %s", nuclei_jsonl.name)
-        nuclei_index = _load_nuclei_index(nuclei_jsonl, log)
+    vuln_findings: list[dict] = []
+    if nmap_index or nuclei_index:
+        log.info(
+            "=== Pass 2: vuln correlation (%d nmap, %d nuclei hosts) ===",
+            len(nmap_index),
+            len(nuclei_index),
+        )
+        vuln_findings = _correlate_vuln(entries, nmap_index, nuclei_index, log)
+        log.info(
+            "Vuln findings: %d total (%d high, %d medium, %d low)",
+            len(vuln_findings),
+            sum(1 for f in vuln_findings if f["confidence"] == "high"),
+            sum(1 for f in vuln_findings if f["confidence"] == "medium"),
+            sum(1 for f in vuln_findings if f["confidence"] == "low"),
+        )
     else:
-        log.info("No nuclei JSONL found in %s — skipping nuclei correlation", scan_dir)
+        log.info("Pass 2 skipped — no scan data available")
 
-    if not nmap_index and not nuclei_index:
-        log.error("No scan data available. Run 'so-ops scan' first.")
-        print("No scan data available. Run 'so-ops scan' first.")
-        state.finish_run(correlations=0)
-        return
-
-    log.info(
-        "Scan data: %d nmap hosts, %d nuclei hosts",
-        len(nmap_index),
-        len(nuclei_index),
-    )
-
-    # ── Correlate ─────────────────────────────────────────────────────
-    log.info("=== Running correlation (%d triage alerts) ===", len(triage_entries))
-    findings = _correlate(triage_entries, nmap_index, nuclei_index, log)
-    log.info(
-        "Correlation complete: %d findings (%d high, %d medium, %d low)",
-        len(findings),
-        sum(1 for f in findings if f["confidence"] == "high"),
-        sum(1 for f in findings if f["confidence"] == "medium"),
-        sum(1 for f in findings if f["confidence"] == "low"),
-    )
-
-    # ── Write JSONL findings log ──────────────────────────────────────
+    # ── Write JSONL log ───────────────────────────────────────────────
     findings_log = log_dir / "correlate_findings.jsonl"
-    for finding in findings:
+    all_findings = patterns + vuln_findings
+    for item in all_findings:
         with open(findings_log, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(finding) + "\n")
-    log.info("Findings written to %s", findings_log)
+            fh.write(json.dumps(item) + "\n")
+    log.info("Wrote %d findings to %s", len(all_findings), findings_log)
 
-    # ── Build and save report ─────────────────────────────────────────
+    # ── Build report ──────────────────────────────────────────────────
     report = _build_report(
-        findings,
-        triage_count=len(triage_entries),
+        patterns=patterns,
+        vuln_findings=vuln_findings,
+        triage_count=len(entries),
         nmap_hosts=len(nmap_index),
         nuclei_hosts=len(nuclei_index),
         lookback_hours=lookback_hours,
@@ -751,34 +1088,49 @@ def run_correlate(cfg: Config, lookback_hours: int = 48):
     )
     report_path = correlate_dir / f"report_{timestamp}.md"
     report_path.write_text(report, encoding="utf-8")
-    log.info("Report saved: %s", report_path)
+    log.info("Report: %s", report_path)
 
-    state.finish_run(correlations=len(findings))
+    state.finish_run(correlations=len(all_findings))
 
-    # ── Console output ────────────────────────────────────────────────
-    high = [f for f in findings if f["confidence"] == "high"]
-    med = [f for f in findings if f["confidence"] == "medium"]
-    low = [f for f in findings if f["confidence"] == "low"]
-    changes = [f for f in findings if f["verdict_changed"]]
+    # ── Console summary ───────────────────────────────────────────────
+    high_p = [p for p in patterns if p["confidence"] == "high"]
+    changes = [f for f in vuln_findings if f["verdict_changed"]]
 
     print("\n" + "=" * 60)
     print("CORRELATION COMPLETE")
     print("=" * 60)
-    print(f"Triage alerts checked: {len(triage_entries)} (last {lookback_hours}h)")
-    print(f"Scan hosts: {len(nmap_index)} nmap, {len(nuclei_index)} nuclei")
+    print(f"Alerts analysed: {len(entries)} (last {lookback_hours}h)")
     print(
-        f"Correlations: {len(findings)} total  ({len(high)} high / {len(med)} medium / {len(low)} low)"
+        f"Alert patterns:  {len(patterns)} ({sum(1 for p in patterns if p['confidence'] == 'high')} high / "
+        f"{sum(1 for p in patterns if p['confidence'] == 'medium')} medium / "
+        f"{sum(1 for p in patterns if p['confidence'] == 'low')} low)"
     )
-    print(f"Verdict upgrades recommended: {len(changes)}")
+    print(
+        f"Vuln findings:   {len(vuln_findings)} ({sum(1 for f in vuln_findings if f['confidence'] == 'high')} high / "
+        f"{sum(1 for f in vuln_findings if f['confidence'] == 'medium')} medium / "
+        f"{sum(1 for f in vuln_findings if f['confidence'] == 'low')} low)"
+    )
+    print(f"Verdict upgrades: {len(changes)}")
 
-    if high:
-        print("\nHIGH CONFIDENCE FINDINGS:")
-        for f in high:
-            print(f"  [{f['recommended_verdict']}] {f['rule_name'][:65]}")
-            print(f"        → {f['matched_ip']} ({f['direction']}) | {f['reason'][:72]}")
+    if high_p:
+        print("\nHIGH CONFIDENCE PATTERNS:")
+        _labels = {
+            "scan_to_exploit": "SCAN→EXPLOIT",
+            "targeted_host": "TARGETED HOST",
+            "c2_beacon": "C2 BEACON",
+            "lateral_movement": "LATERAL MOVEMENT",
+            "port_sweep": "PORT SWEEP",
+            "multi_rule_pair": "MULTI-RULE PAIR",
+            "high_volume_src": "HIGH VOLUME",
+        }
+        for p in high_p:
+            label = _labels.get(p["pattern_type"], p["pattern_type"].upper())
+            peer = f" → {p['peer_ip']}" if p["peer_ip"] else ""
+            print(f"  [{p['recommended_verdict']}] {label}: {p['pivot_ip']}{peer}")
+            print(f"        {p['reason'][:80]}")
 
     if changes:
-        print("\nRECOMMENDED UPGRADES:")
+        print("\nVULN VERDICT UPGRADES:")
         for f in changes:
             print(
                 f"  {f['triage_verdict']:6s} → {f['recommended_verdict']:6s}  {f['rule_name'][:55]}"
