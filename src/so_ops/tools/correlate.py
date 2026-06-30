@@ -593,13 +593,13 @@ def run_correlate(cfg: Config, lookback_hours: int = 48):
     log.info("Triage lookback: %dh", lookback_hours)
 
     # ── Load triage alerts ────────────────────────────────────────────
-    triage_jsonl = log_dir / "triage_alerts.jsonl"
+    triage_jsonl = log_dir / "triage.jsonl"
     triage_entries: list[dict] = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
     if not triage_jsonl.exists():
         log.warning("No triage log found at %s — run 'so-ops triage' first", triage_jsonl)
-        print(f"No triage log found. Run 'so-ops triage' first.\nExpected: {triage_jsonl}")
+        print(f"No triage log found. Run 'so-ops triage' first.\nExpected:  {triage_jsonl}")
         state.finish_run(correlations=0)
         return
 
