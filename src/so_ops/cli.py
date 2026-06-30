@@ -63,7 +63,11 @@ def cmd_config_check(args, cfg):
 def cmd_correlate(args, cfg):
     from so_ops.tools.correlate import run_correlate
 
-    run_correlate(cfg, lookback_hours=args.lookback_hours)
+    minutes = getattr(args, "lookback_minutes", None)
+    if minutes is not None:
+        run_correlate(cfg, lookback_minutes=minutes)
+    else:
+        run_correlate(cfg, lookback_hours=args.lookback_hours)
 
 
 def cmd_test_notify(args, cfg):
@@ -106,7 +110,7 @@ def main():
     p_scan.add_argument("--dry-run", action="store_true", help="Skip AI summary and notifications")
 
     p_correlate = sub.add_parser(
-        "correlate", help="Cross-reference triage alerts with vulnscan results (no LLM)"
+        "correlate", help="Cross-reference triage alerts with vulnscan results"
     )
     p_correlate.add_argument(
         "--lookback-hours",
@@ -114,6 +118,13 @@ def main():
         default=48,
         metavar="N",
         help="Hours of triage history to check (default: 48)",
+    )
+    p_correlate.add_argument(
+        "--lookback-minutes",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Minutes of triage history to check (overrides --lookback-hours)",
     )
 
     sub.add_parser("status", help="Show last run times/results")

@@ -104,6 +104,7 @@ def _build_pattern(
     dest_ips: list[str] | None = None,
     dest_port: str = "",
     peer_ip: str = "",
+    community_ids: list[str] | None = None,
 ) -> dict:
     return {
         "correlated_at": datetime.now(timezone.utc).isoformat(),
@@ -124,6 +125,7 @@ def _build_pattern(
         "confidence_rank": {"high": 0, "medium": 1, "low": 2}.get(confidence, 9),
         "verdict_rank": _verdict_rank(recommended_verdict),
         "reason": reason,
+        "community_ids": sorted(set(community_ids or []))[:10],
     }
 
 
@@ -199,6 +201,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=dest_ips,
+                community_ids=[
+                    e.get("community_id", "") for e in src_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -235,6 +240,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=[dest_ip],
+                community_ids=[
+                    e.get("community_id", "") for e in dest_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -275,6 +283,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=sorted(internal_dests),
+                community_ids=[
+                    e.get("community_id", "") for e in src_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -319,6 +330,9 @@ def _correlate_alert_patterns(
                 time_last=times[-1] if times else "",
                 dest_ips=sorted(distinct_dests),
                 dest_port=port,
+                community_ids=[
+                    e.get("community_id", "") for e in port_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -355,6 +369,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=[dest_ip],
+                community_ids=[
+                    e.get("community_id", "") for e in pair_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -392,6 +409,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=[dest_ip],
+                community_ids=[
+                    e.get("community_id", "") for e in c2_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -436,6 +456,9 @@ def _correlate_alert_patterns(
                 alert_count=len(src_entries),
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
+                community_ids=[
+                    e.get("community_id", "") for e in src_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -481,6 +504,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=sorted(internal_dests),
+                community_ids=[
+                    e.get("community_id", "") for e in src_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -524,6 +550,9 @@ def _correlate_alert_patterns(
                 time_last=times[-1] if times else "",
                 dest_ips=[dest_ip],
                 dest_port=ports_hit[0] if len(ports_hit) == 1 else ", ".join(ports_hit),
+                community_ids=[
+                    e.get("community_id", "") for e in auth_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -573,6 +602,9 @@ def _correlate_alert_patterns(
                 time_last=times[-1] if times else "",
                 dest_ips=dest_ips,
                 dest_port=dest_ports[0] if len(dest_ports) == 1 else "",
+                community_ids=[
+                    e.get("community_id", "") for e in flood_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -626,6 +658,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=[dest_ip],
+                community_ids=[
+                    e.get("community_id", "") for e in exploit_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -676,6 +711,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=dest_ips,
+                community_ids=[
+                    e.get("community_id", "") for e in src_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -719,6 +757,9 @@ def _correlate_alert_patterns(
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
                 dest_ips=[dest_ip],
+                community_ids=[
+                    e.get("community_id", "") for e in dest_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -778,6 +819,9 @@ def _correlate_alert_patterns(
                 time_last=times[-1] if times else "",
                 dest_ips=dest_ips,
                 dest_port=port,
+                community_ids=[
+                    e.get("community_id", "") for e in port_entries if e.get("community_id")
+                ],
             )
         )
 
@@ -1016,6 +1060,7 @@ def _build_vuln_finding(
         "host_hostname": host_info.get("hostname", "") if host_info else "",
         "host_cve_count": len(host_info["cves"]) if host_info else 0,
         "host_top_cvss": host_info["cves"][0]["cvss"] if host_info and host_info["cves"] else 0.0,
+        "community_id": entry.get("community_id", ""),
     }
 
 
@@ -1193,7 +1238,7 @@ def _build_report(
     triage_count: int,
     nmap_hosts: int,
     nuclei_hosts: int,
-    lookback_hours: int,
+    lookback_hours: str,
     nmap_file: str,
     nuclei_file: str,
     run_time: str,
@@ -1210,7 +1255,7 @@ def _build_report(
     lines = [
         "# Alert Correlation Report",
         f"**Run:** {run_time}",
-        f"**Triage alerts:** {triage_count} (last {lookback_hours}h)",
+        f"**Triage alerts:** {triage_count} (last {lookback_hours})",
         f"**Vulnscan hosts:** {nmap_hosts} nmap / {nuclei_hosts} nuclei",
         f"**Nmap source:** {nmap_file}  |  **Nuclei source:** {nuclei_file}",
         "",
@@ -1511,7 +1556,15 @@ def _summarize_with_llm(
         return None
 
 
-def run_correlate(cfg: Config, lookback_hours: int = 3):
+def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int | None = None):
+    # lookback_minutes overrides lookback_hours when provided
+    if lookback_minutes is not None:
+        _lookback = timedelta(minutes=lookback_minutes)
+        _lookback_label = f"{lookback_minutes}m"
+    else:
+        _lookback = timedelta(hours=lookback_hours)
+        _lookback_label = f"{lookback_hours}h"
+
     data_dir = cfg.paths.data_dir
     log_dir = data_dir / "logs"
     state_dir = data_dir / "state"
@@ -1526,12 +1579,12 @@ def run_correlate(cfg: Config, lookback_hours: int = 3):
     run_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     log.info("=== Starting correlation run: %s ===", run_time)
-    log.info("Triage lookback: %dh", lookback_hours)
+    log.info("Triage lookback: %s", _lookback_label)
 
     # ── Load triage log ───────────────────────────────────────────────
     triage_jsonl = log_dir / "triage.jsonl"
     entries: list[dict] = []
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    cutoff = datetime.now(timezone.utc) - _lookback
 
     if not triage_jsonl.exists():
         log.warning("No triage log at %s — run 'so-ops triage' first", triage_jsonl)
@@ -1561,8 +1614,8 @@ def run_correlate(cfg: Config, lookback_hours: int = 3):
     log.info("Triage log: %d total, %d in window, %d skipped", total, len(entries), skipped)
 
     if not entries:
-        log.warning("No alerts in last %dh", lookback_hours)
-        print(f"No triage alerts in the last {lookback_hours}h.")
+        log.warning("No alerts in last %s", _lookback_label)
+        print(f"No triage alerts in the last {_lookback_label}.")
         state.finish_run(correlations=0)
         return
 
@@ -1629,7 +1682,7 @@ def run_correlate(cfg: Config, lookback_hours: int = 3):
         triage_count=len(entries),
         nmap_hosts=len(nmap_index),
         nuclei_hosts=len(nuclei_index),
-        lookback_hours=lookback_hours,
+        lookback_hours=_lookback_label,
         nmap_file=nmap_xml.name if nmap_xml else "none",
         nuclei_file=nuclei_jsonl.name if nuclei_jsonl else "none",
         run_time=run_time,
@@ -1659,7 +1712,7 @@ def run_correlate(cfg: Config, lookback_hours: int = 3):
     print("\n" + "=" * 60)
     print("CORRELATION COMPLETE")
     print("=" * 60)
-    print(f"Alerts analysed:  {len(entries)} (last {lookback_hours}h)")
+    print(f"Alerts analysed:  {len(entries)} (last {_lookback_label})")
     print(
         f"Alert patterns:   {len(patterns)} "
         f"({high_count} high / {med_count} medium / "
