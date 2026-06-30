@@ -27,7 +27,7 @@ def cmd_health(args, cfg):
 def cmd_scan(args, cfg):
     from so_ops.tools.vulnscan import run_vulnscan
 
-    run_vulnscan(cfg, scan_type=args.type)
+    run_vulnscan(cfg, scan_type=args.type, dry_run=args.dry_run)
 
 
 def cmd_status(args, cfg):
@@ -103,6 +103,7 @@ def main():
     p_scan.add_argument(
         "--type", choices=["nmap", "nuclei", "all"], default="all", help="Scan type (default: all)"
     )
+    p_scan.add_argument("--dry-run", action="store_true", help="Skip AI summary and notifications")
 
     p_correlate = sub.add_parser(
         "correlate", help="Cross-reference triage alerts with vulnscan results (no LLM)"

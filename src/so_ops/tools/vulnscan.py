@@ -9,7 +9,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-from so_ops.clients import make_llm_client
 from so_ops.clients.base import LLMClient
 from so_ops.clients.notify import notify_all
 from so_ops.config import Config
@@ -315,7 +314,7 @@ Executive Summary:"""
 # ── Entry point ──────────────────────────────────────────────────────
 
 
-def run_vulnscan(cfg: Config, scan_type: str = "all"):
+def run_vulnscan(cfg: Config, scan_type: str = "all", dry_run: bool = False):
     """Main vulnscan entry point. scan_type: 'all', 'nmap', or 'nuclei'."""
     data_dir = cfg.paths.data_dir
     log_dir = data_dir / "logs"
@@ -327,7 +326,9 @@ def run_vulnscan(cfg: Config, scan_type: str = "all"):
     state = ToolState("vulnscan", state_dir)
     state.start_run()
 
-    llm = make_llm_client(cfg)
+    if dry_run:
+        log.info("DRY RUN: AI summary and notifications will be skipped")
+
     vs = cfg.vulnscan
     targets = vs.targets
 
@@ -389,53 +390,60 @@ def run_vulnscan(cfg: Config, scan_type: str = "all"):
     report_path.write_text(report)
     log.info("Report saved: %s", report_path)
 
-    log.info("=== Generating AI summary ===")
     llm_log_path = log_dir / "vulnscan_llm_calls.jsonl"
-    ai_summary = _generate_ai_summary(report, llm)
-
-    llm_entry = {
-        "called_at": datetime.now(timezone.utc).isoformat(),
-        "tool": "vulnscan",
-        "scan_timestamp": timestamp,
-        "prompt_chars": len(report[:4000]),
-        "hosts_scanned": len(hosts),
-        "cves_found": len(vulns),
-        "nuclei_findings": len(nuclei_findings),
-        "raw_response": ai_summary,
-    }
-    with open(llm_log_path, "a") as f:
-        f.write(json.dumps(llm_entry) + "\n")
-
-    if ai_summary:
-        full_report = f"## AI Executive Summary\n\n{ai_summary}\n\n---\n\n{report}"
-    else:
-        log.warning("AI summary generation failed, using raw report")
-        full_report = report
-
     full_report_path = scan_dir / f"full_report_{timestamp}.md"
-    full_report_path.write_text(full_report)
-    log.info("Full report saved: %s", full_report_path)
 
-    log.info("=== Sending notifications ===")
-    vuln_count = len(vulns) + len(nuclei_findings)
-    subject = f"[VulnScan] {timestamp} - {len(hosts)} hosts, {vuln_count} findings"
-    notify_log_path = log_dir / "vulnscan_notifications.jsonl"
-    providers = notify_all(cfg.notifications, subject, full_report)
-    notify_entry = {
-        "sent_at": datetime.now(timezone.utc).isoformat(),
-        "subject": subject,
-        "hosts": len(hosts),
-        "cves": len(vulns),
-        "nuclei_findings": len(nuclei_findings),
-        "providers": providers,
-    }
-    with open(notify_log_path, "a") as f:
-        f.write(json.dumps(notify_entry) + "\n")
+    if dry_run:
+        log.info("DRY RUN: skipping AI summary and notifications")
+        full_report_path.write_text(report)
+        log.info("Raw report saved (no AI summary): %s", full_report_path)
+    else:
+        log.info("=== Generating AI summary ===")
+        llm = make_llm_client(cfg)
+        ai_summary = _generate_ai_summary(report, llm)
+
+        llm_entry = {
+            "called_at": datetime.now(timezone.utc).isoformat(),
+            "tool": "vulnscan",
+            "scan_timestamp": timestamp,
+            "prompt_chars": len(report[:4000]),
+            "hosts_scanned": len(hosts),
+            "cves_found": len(vulns),
+            "nuclei_findings": len(nuclei_findings),
+            "raw_response": ai_summary,
+        }
+        with open(llm_log_path, "a") as f:
+            f.write(json.dumps(llm_entry) + "\n")
+
+        if ai_summary:
+            full_report = f"## AI Executive Summary\n\n{ai_summary}\n\n---\n\n{report}"
+        else:
+            log.warning("AI summary generation failed, using raw report")
+            full_report = report
+
+        full_report_path.write_text(full_report)
+        log.info("Full report saved: %s", full_report_path)
+
+        log.info("=== Sending notifications ===")
+        vuln_count = len(vulns) + len(nuclei_findings)
+        subject = f"[VulnScan] {timestamp} - {len(hosts)} hosts, {vuln_count} findings"
+        notify_log_path = log_dir / "vulnscan_notifications.jsonl"
+        providers = notify_all(cfg.notifications, subject, full_report)
+        notify_entry = {
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "subject": subject,
+            "hosts": len(hosts),
+            "cves": len(vulns),
+            "nuclei_findings": len(nuclei_findings),
+            "providers": providers,
+        }
+        with open(notify_log_path, "a") as f:
+            f.write(json.dumps(notify_entry) + "\n")
 
     state.finish_run(hosts=len(hosts), cves=len(vulns), nuclei=len(nuclei_findings))
 
     print("\n" + "=" * 60)
-    print("SCAN COMPLETE")
+    print("SCAN COMPLETE" + (" (DRY RUN)" if dry_run else ""))
     print("=" * 60)
     print(f"Hosts: {len(hosts)}")
     print(f"CVEs (nmap): {len(vulns)}")
