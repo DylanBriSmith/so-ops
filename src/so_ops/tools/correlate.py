@@ -66,7 +66,7 @@ def _max_verdict(*verdicts: str) -> str:
 # Thresholds
 _LATERAL_DEST_MIN = 4  # distinct internal dest_ips from one src = lateral movement
 _PORT_SWEEP_MIN = 3  # same port on N distinct hosts = port sweep
-_MULTI_RULE_PAIR_MIN = 4  # distinct rules on same src→dest pair = sustained attack
+_MULTI_RULE_PAIR_MIN = 4  # distinct rules on same src->dest pair = sustained attack
 _HIGH_VOL_MIN = 30  # alerts from one src = high-volume flag
 _C2_RULE_MIN = 3  # distinct TROJAN/MALWARE rules on same pair = C2 pattern
 
@@ -161,7 +161,7 @@ def _correlate_alert_patterns(
             f"{', '.join(sorted(set(exploit_rules))[:3])}...) — classic attack chain"
         )
         log.info(
-            "  SCAN→EXPLOIT [src=%s]: %d scan + %d exploit rules, %d targets",
+            "  SCAN->EXPLOIT [src=%s]: %d scan + %d exploit rules, %d targets",
             src_ip,
             len(set(scan_rules)),
             len(set(exploit_rules)),
@@ -318,7 +318,7 @@ def _correlate_alert_patterns(
             f"across {len(pair_entries)} alerts — sustained, varied activity on this connection"
         )
         log.info(
-            "  MULTI-RULE PAIR [%s→%s]: %d distinct rules", src_ip, dest_ip, len(distinct_rules)
+            "  MULTI-RULE PAIR [%s->%s]: %d distinct rules", src_ip, dest_ip, len(distinct_rules)
         )
         patterns.append(
             _build_pattern(
@@ -357,7 +357,7 @@ def _correlate_alert_patterns(
             f"across {len(c2_entries)} alerts — possible C2 channel or infected host"
         )
         log.info(
-            "  C2 BEACON [%s→%s]: %d trojan/malware rules", src_ip, dest_ip, len(distinct_c2_rules)
+            "  C2 BEACON [%s->%s]: %d trojan/malware rules", src_ip, dest_ip, len(distinct_c2_rules)
         )
         patterns.append(
             _build_pattern(
@@ -701,7 +701,7 @@ def _correlate_one_ip_vuln(
             )
             matched = True
             log.info(
-                "  EXACT CVE [%s]: %s → %s on %s (CVSS %.1f)",
+                "  EXACT CVE [%s]: %s -> %s on %s (CVSS %.1f)",
                 direction,
                 rule_name[:50],
                 cve,
