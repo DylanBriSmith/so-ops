@@ -18,6 +18,8 @@ try:
 except ImportError:
     import xml.etree.ElementTree as ET  # type: ignore[no-redef]
 
+from so_ops.clients import make_llm_client
+from so_ops.clients.notify import notify_all
 from so_ops.config import Config
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
@@ -1509,7 +1511,7 @@ def _summarize_with_llm(
         return None
 
 
-def run_correlate(cfg: Config, lookback_hours: int = 48):
+def run_correlate(cfg: Config, lookback_hours: int = 3):
     data_dir = cfg.paths.data_dir
     log_dir = data_dir / "logs"
     state_dir = data_dir / "state"
