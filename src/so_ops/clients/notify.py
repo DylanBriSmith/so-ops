@@ -47,11 +47,13 @@ def _send_sms(cfg: dict, subject: str, body: str, short: str) -> bool:
         f"{cfg['twilio_account_sid']}:{cfg['twilio_auth_token']}".encode()
     ).decode()
 
-    data = urllib.parse.urlencode({
-        "To": cfg["to_number"],
-        "From": cfg["from_number"],
-        "Body": message,
-    }).encode()
+    data = urllib.parse.urlencode(
+        {
+            "To": cfg["to_number"],
+            "From": cfg["from_number"],
+            "Body": message,
+        }
+    ).encode()
 
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Authorization", f"Basic {creds}")
@@ -139,28 +141,42 @@ def _send_webhook(cfg: dict, subject: str, body: str, short: str) -> bool:
 
 
 def _send_teams(cfg: dict, subject: str, body: str, short: str) -> bool:
-    severity = "HIGH" if "HIGH" in subject.upper() else "MEDIUM" if "MEDIUM" in subject.upper() else "LOW"
+    severity = (
+        "HIGH" if "HIGH" in subject.upper() else "MEDIUM" if "MEDIUM" in subject.upper() else "LOW"
+    )
     color = "Attention" if severity == "HIGH" else "Warning" if severity == "MEDIUM" else "Good"
 
     body_blocks = [
-        {"type": "TextBlock", "text": f"&#x26A0; {subject}", "wrap": True,
-         "size": "Large", "weight": "Bolder", "color": color},
+        {
+            "type": "TextBlock",
+            "text": f"&#x26A0; {subject}",
+            "wrap": True,
+            "size": "Large",
+            "weight": "Bolder",
+            "color": color,
+        },
     ]
-    for line in (short or body).splitlines():
-        body_blocks.append({"type": "TextBlock", "text": line or "​", "wrap": True, "spacing": "None"})
+    for line in body.splitlines():
+        body_blocks.append(
+            {"type": "TextBlock", "text": line or "​", "wrap": True, "spacing": "None"}
+        )
 
-    payload = json.dumps({
-        "type": "message",
-        "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "content": {
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.4",
-                "body": body_blocks,
-            },
-        }],
-    }).encode()
+    payload = json.dumps(
+        {
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": {
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "type": "AdaptiveCard",
+                        "version": "1.4",
+                        "body": body_blocks,
+                    },
+                }
+            ],
+        }
+    ).encode()
 
     req = urllib.request.Request(cfg["url"], data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -187,7 +203,9 @@ PROVIDERS: dict[str, callable] = {
 }
 
 
-def notify_all(notifications_cfg: dict, subject: str, body: str, short: str = "") -> dict[str, bool]:
+def notify_all(
+    notifications_cfg: dict, subject: str, body: str, short: str = ""
+) -> dict[str, bool]:
     """Send to all enabled notification providers. Returns {provider: success}."""
     results: dict[str, bool] = {}
     short = short or body[:300]
