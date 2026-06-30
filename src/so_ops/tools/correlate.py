@@ -1,4 +1,9 @@
-"""Alert correlation engine: alert×alert patterns + alert×vulnscan cross-reference. No LLM."""
+"""Alert correlation engine: alert×alert patterns + alert×vulnscan cross-reference.
+
+Pass 1: pure rule-based pattern detection (always runs, no LLM).
+Pass 2: alert × vulnscan cross-reference (optional, needs scan data).
+Pass 3: LLM brief — HIGH+MEDIUM findings sent to LLM for prioritised analyst summary.
+"""
 
 from __future__ import annotations
 
@@ -1190,6 +1195,7 @@ def _build_report(
     nmap_file: str,
     nuclei_file: str,
     run_time: str,
+    llm_brief: str | None = None,
 ) -> str:
     high_p = [p for p in patterns if p["confidence"] == "high"]
     med_p = [p for p in patterns if p["confidence"] == "medium"]
@@ -1206,6 +1212,18 @@ def _build_report(
         f"**Vulnscan hosts:** {nmap_hosts} nmap / {nuclei_hosts} nuclei",
         f"**Nmap source:** {nmap_file}  |  **Nuclei source:** {nuclei_file}",
         "",
+    ]
+
+    if llm_brief:
+        lines += [
+            "---",
+            "# Analyst Brief (AI)",
+            "",
+            llm_brief.strip(),
+            "",
+        ]
+
+    lines += [
         "## Summary",
         "",
         f"### Alert Patterns (alert × alert) — {len(patterns)} patterns",
@@ -1362,6 +1380,135 @@ def _build_report(
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
+def _summarize_with_llm(
+    patterns: list[dict],
+    vuln_findings: list[dict],
+    cfg: Config,
+    log,
+) -> str | None:
+    """Send HIGH+MEDIUM findings to LLM and get a prioritised analyst brief.
+
+    Returns the LLM response text, or None if LLM is unavailable or no findings.
+    IPs are scrubbed before sending to the cloud LLM.
+    """
+    high_med_patterns = [p for p in patterns if p["confidence"] in ("high", "medium")]
+    high_med_vulns = [f for f in vuln_findings if f["confidence"] in ("high", "medium")]
+
+    if not high_med_patterns and not high_med_vulns:
+        log.info("LLM brief: no HIGH/MEDIUM findings — skipping")
+        return None
+
+    # Build IP scrubbing map
+    all_ips: set[str] = set()
+    for p in high_med_patterns:
+        if p.get("pivot_ip"):
+            all_ips.add(p["pivot_ip"])
+        if p.get("peer_ip"):
+            all_ips.add(p["peer_ip"])
+        all_ips.update(p.get("dest_ips", []))
+    for f in high_med_vulns:
+        for field in ("source_ip", "dest_ip", "matched_ip"):
+            if f.get(field):
+                all_ips.add(f[field])
+
+    internal_prefixes = cfg.network.internal_prefixes
+    scrub = getattr(getattr(cfg, "triage", None), "scrub_ips", True)
+
+    ip_map: dict[str, str] = {}
+    if scrub:
+        int_n = ext_n = 0
+        for ip in sorted(all_ips):
+            if any(ip.startswith(px) for px in internal_prefixes):
+                int_n += 1
+                ip_map[ip] = f"INT-{int_n:03d}"
+            else:
+                ext_n += 1
+                ip_map[ip] = f"EXT-{ext_n:03d}"
+
+    def _s(text: str) -> str:
+        for real, token in ip_map.items():
+            text = text.replace(real, token)
+        return text
+
+    # Build prompt
+    prompt_lines = [
+        "You are a Security Operations Center analyst reviewing automated correlation findings.",
+        "Below are HIGH and MEDIUM confidence security patterns detected in the last 48 hours.",
+        "",
+        "Your tasks:",
+        "1. Identify the top 3-5 most urgent findings that need immediate investigation.",
+        "   For each: state WHY it is urgent and WHAT the analyst should do first.",
+        "2. If multiple findings share an IP, call that out — it may be one coordinated attacker.",
+        "3. Summarize the remaining findings in 2-3 sentences.",
+        "4. End with a one-line overall risk level: LOW / MEDIUM / HIGH / CRITICAL.",
+        "",
+        "Be concise and actionable. Focus on what needs to happen RIGHT NOW.",
+        "",
+        "--- FINDINGS ---",
+        "",
+    ]
+
+    for i, p in enumerate(high_med_patterns, 1):
+        pivot = _s(p.get("pivot_ip", ""))
+        peer = _s(p.get("peer_ip", ""))
+        dest_shown = [_s(ip) for ip in p.get("dest_ips", [])[:8]]
+        more_dest = f" (+{len(p['dest_ips']) - 8} more)" if len(p.get("dest_ips", [])) > 8 else ""
+        prompt_lines.append(
+            f"[P{i}] {p['pattern_type'].upper()} | {p['confidence'].upper()} confidence"
+            f" | recommended={p['recommended_verdict']}"
+        )
+        if pivot:
+            prompt_lines.append(
+                f"  Pivot: {pivot} (as {p['pivot_role']})" + (f" | Peer: {peer}" if peer else "")
+            )
+        if dest_shown:
+            prompt_lines.append(f"  Hosts: {', '.join(dest_shown)}{more_dest}")
+        if p.get("dest_port"):
+            prompt_lines.append(f"  Port: {p['dest_port']}")
+        prompt_lines.append(
+            f"  Alerts: {p['alert_count']}"
+            f" | Window: {p.get('time_first', '')[:16]} to {p.get('time_last', '')[:16]}"
+        )
+        prompt_lines.append(f"  Reason: {_s(p['reason'])}")
+        if p.get("rule_names"):
+            rule_preview = ", ".join(p["rule_names"][:5])
+            extra = f" (+{len(p['rule_names']) - 5} more)" if len(p["rule_names"]) > 5 else ""
+            prompt_lines.append(f"  Rules: {rule_preview}{extra}")
+        prompt_lines.append("")
+
+    for i, f in enumerate(high_med_vulns, 1):
+        prompt_lines.append(
+            f"[V{i}] VULN CORRELATION | {f['confidence'].upper()} confidence"
+            f" | {f['triage_verdict']} -> {f['recommended_verdict']}"
+        )
+        prompt_lines.append(f"  Alert: {f['rule_name'][:70]}")
+        prompt_lines.append(
+            f"  Traffic: {_s(f.get('source_ip', '?'))} -> {_s(f.get('dest_ip', '?'))}:{f.get('dest_port', '?')}"
+            f" | matched host: {_s(f.get('matched_ip', '?'))} ({f.get('direction', '?')})"
+        )
+        prompt_lines.append(f"  Match: {f['match_type']} | {_s(f['reason'])}")
+        if f.get("matched_cves"):
+            prompt_lines.append(f"  CVEs: {', '.join(f['matched_cves'][:5])}")
+        prompt_lines.append("")
+
+    prompt = "\n".join(prompt_lines)
+    log.info(
+        "LLM brief: sending %d patterns + %d vuln findings (%d chars)",
+        len(high_med_patterns),
+        len(high_med_vulns),
+        len(prompt),
+    )
+
+    try:
+        llm = make_llm_client(cfg)
+        brief = llm.generate(prompt, temperature=0.3)
+        log.info("LLM brief: received %d chars", len(brief))
+        return brief
+    except Exception as exc:
+        log.warning("LLM brief failed (%s) — report will proceed without it", exc)
+        return None
+
+
 def run_correlate(cfg: Config, lookback_hours: int = 48):
     data_dir = cfg.paths.data_dir
     log_dir = data_dir / "logs"
@@ -1469,6 +1616,10 @@ def run_correlate(cfg: Config, lookback_hours: int = 48):
             fh.write(json.dumps(item) + "\n")
     log.info("Wrote %d findings to %s", len(all_findings), findings_log)
 
+    # ── Pass 3: LLM analyst brief ─────────────────────────────────────
+    log.info("=== Pass 3: LLM analyst brief ===")
+    llm_brief = _summarize_with_llm(patterns, vuln_findings, cfg, log)
+
     # ── Build report ──────────────────────────────────────────────────
     report = _build_report(
         patterns=patterns,
@@ -1480,6 +1631,7 @@ def run_correlate(cfg: Config, lookback_hours: int = 48):
         nmap_file=nmap_xml.name if nmap_xml else "none",
         nuclei_file=nuclei_jsonl.name if nuclei_jsonl else "none",
         run_time=run_time,
+        llm_brief=llm_brief,
     )
     report_path = correlate_dir / f"report_{timestamp}.md"
     report_path.write_text(report, encoding="utf-8")
@@ -1487,49 +1639,75 @@ def run_correlate(cfg: Config, lookback_hours: int = 48):
 
     state.finish_run(correlations=len(all_findings))
 
+    # ── Notify ────────────────────────────────────────────────────────
+    high_count = sum(1 for p in patterns if p["confidence"] == "high")
+    med_count = sum(1 for p in patterns if p["confidence"] == "medium")
+    changes = [f for f in vuln_findings if f["verdict_changed"]]
+
+    if llm_brief and (high_count or med_count or changes):
+        notify_title = f"[so-ops] Correlation: {high_count} high / {med_count} medium patterns"
+        notify_body = llm_brief.strip()
+        notify_short = f"{high_count} HIGH + {med_count} MEDIUM patterns detected"
+        notify_all(cfg.notifications, notify_title, notify_body, short=notify_short)
+        log.info("Notification sent")
+
     # ── Console summary ───────────────────────────────────────────────
     high_p = [p for p in patterns if p["confidence"] == "high"]
-    changes = [f for f in vuln_findings if f["verdict_changed"]]
 
     print("\n" + "=" * 60)
     print("CORRELATION COMPLETE")
     print("=" * 60)
-    print(f"Alerts analysed: {len(entries)} (last {lookback_hours}h)")
+    print(f"Alerts analysed:  {len(entries)} (last {lookback_hours}h)")
     print(
-        f"Alert patterns:  {len(patterns)} ({sum(1 for p in patterns if p['confidence'] == 'high')} high / "
-        f"{sum(1 for p in patterns if p['confidence'] == 'medium')} medium / "
+        f"Alert patterns:   {len(patterns)} "
+        f"({high_count} high / {med_count} medium / "
         f"{sum(1 for p in patterns if p['confidence'] == 'low')} low)"
     )
     print(
-        f"Vuln findings:   {len(vuln_findings)} ({sum(1 for f in vuln_findings if f['confidence'] == 'high')} high / "
+        f"Vuln findings:    {len(vuln_findings)} "
+        f"({sum(1 for f in vuln_findings if f['confidence'] == 'high')} high / "
         f"{sum(1 for f in vuln_findings if f['confidence'] == 'medium')} medium / "
         f"{sum(1 for f in vuln_findings if f['confidence'] == 'low')} low)"
     )
     print(f"Verdict upgrades: {len(changes)}")
 
+    _con_labels = {
+        "scan_to_exploit": "SCAN->EXPLOIT",
+        "targeted_host": "TARGETED HOST",
+        "c2_beacon": "C2 BEACON",
+        "inbound_sweep": "INBOUND SWEEP",
+        "internal_exploit": "INTERNAL EXPLOIT",
+        "brute_force": "BRUTE FORCE",
+        "single_rule_flood": "RULE FLOOD",
+        "lateral_movement": "LATERAL MOVEMENT",
+        "port_sweep": "PORT SWEEP",
+        "multi_rule_pair": "MULTI-RULE PAIR",
+        "high_volume_src": "HIGH VOLUME",
+        "src_ip_pivot": "SRC PIVOT",
+        "dest_ip_pivot": "DEST PIVOT",
+        "dest_port_pivot": "PORT PIVOT",
+    }
+
     if high_p:
         print("\nHIGH CONFIDENCE PATTERNS:")
-        _labels = {
-            "scan_to_exploit": "SCAN→EXPLOIT",
-            "targeted_host": "TARGETED HOST",
-            "c2_beacon": "C2 BEACON",
-            "lateral_movement": "LATERAL MOVEMENT",
-            "port_sweep": "PORT SWEEP",
-            "multi_rule_pair": "MULTI-RULE PAIR",
-            "high_volume_src": "HIGH VOLUME",
-        }
         for p in high_p:
-            label = _labels.get(p["pattern_type"], p["pattern_type"].upper())
-            peer = f" → {p['peer_ip']}" if p["peer_ip"] else ""
+            label = _con_labels.get(p["pattern_type"], p["pattern_type"].upper())
+            peer = f" -> {p['peer_ip']}" if p["peer_ip"] else ""
             print(f"  [{p['recommended_verdict']}] {label}: {p['pivot_ip']}{peer}")
-            print(f"        {p['reason'][:80]}")
+            print(f"        {p['reason'][:90]}")
 
     if changes:
         print("\nVULN VERDICT UPGRADES:")
         for f in changes:
             print(
-                f"  {f['triage_verdict']:6s} → {f['recommended_verdict']:6s}  {f['rule_name'][:55]}"
+                f"  {f['triage_verdict']:6s} -> {f['recommended_verdict']:6s}  {f['rule_name'][:55]}"
             )
+
+    if llm_brief:
+        print("\n" + "-" * 60)
+        print("ANALYST BRIEF (AI):")
+        print("-" * 60)
+        print(llm_brief.strip())
 
     print(f"\nReport: {report_path}")
     print(f"Log:    {findings_log}")
