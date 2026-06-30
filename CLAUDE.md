@@ -15,8 +15,12 @@ The project intentionally has no third-party Python runtime dependencies. `src/s
 ```
 so-ops init           # interactive setup wizard
 so-ops triage         # query ES alerts, classify via LLM, notify
+so-ops triage --dry-run   # rule-based only, no LLM (used by scheduled task)
 so-ops health         # collect 24h metrics, generate LLM briefing
 so-ops scan           # nmap + nuclei vuln scan
+so-ops correlate      # cross-reference alerts with vulnscan, LLM brief, notify
+so-ops correlate --lookback-hours 48      # default
+so-ops correlate --lookback-minutes 20   # sub-hour window (scheduled use)
 so-ops status         # show last run times and state
 so-ops config-check   # validate config.toml
 so-ops test-notify    # send a test notification
@@ -37,7 +41,7 @@ so-ops triage
 To re-run triage against already-seen alerts (reset the cursor):
 
 ```powershell
-Remove-Item "C:\CBFiles\so-ops-data\state\triage.json" -Force
+Remove-Item "C:\CBScripts\so-ops-data\state\triage.json" -Force
 ```
 
 ## Configuration
@@ -49,6 +53,8 @@ Key env vars:
 - `SO_OPS_OR_API_KEY`  — OpenRouter API key
 - `SO_OPS_CONFIG`      — explicit path to config.toml
 
+Secrets live in `C:\CBScripts\so-ops\.env` (never committed). The scheduled task script loads this file at runtime.
+
 SSL verification is disabled (`verify_ssl = false`) because Security Onion uses self-signed certs.
 
 ## LLM providers
@@ -58,7 +64,7 @@ Two providers are supported, selected via `llm_provider` in config.toml:
 - `ollama` — local inference, requires `[ollama]` section
 - `openrouter` — cloud inference via OpenAI-compatible API, requires `[openrouter]` section and `SO_OPS_OR_API_KEY`
 
-Current deployment uses **openrouter** with model `anthropic/claude-haiku-4-5`.
+Current deployment uses **openrouter** with model `google/gemini-2.5-flash-lite`.
 
 ## Security Onion instance
 
@@ -73,14 +79,73 @@ The `soc_viewer` account is a Security Onion web UI account, not a native ES acc
 
 ## Notifications
 
-All notification channels are currently **disabled** in config.toml. Enable selectively when ready.
+Teams is **enabled**. All other channels are disabled.
 
 Configured channels:
-- `teams` — Microsoft Teams via Power Automate HTTP webhook, sends Adaptive Cards. **Test carefully** — the Teams channel is live and shared. Always test with `so-ops test-notify` before enabling on a scheduled run.
-- `ntfy` — topic `so-ops-test`, push notifications to phone
-- `email`, `discord`, `slack`, `sms`, `gotify`, `webhook` — configured but not set up
+- `teams` — Microsoft Teams via Power Automate HTTP webhook, sends Adaptive Cards. **Test carefully** — the Teams channel is live and shared.
+- `ntfy` — topic `so-ops-test`, disabled
+- `email`, `discord`, `slack`, `sms`, `gotify`, `webhook` — disabled
 
-The Teams provider (`notify.py:_send_teams`) sends an Adaptive Card payload matching the existing Power Automate webhook format used by other tools at Canadian Bearings. Payload shape: `{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","content":{...}}]}`.
+The Teams card body is the LLM analyst brief followed by a `---` divider and a structured per-pattern breakdown (confidence, alert count, time window, pivot IP, peer, targets, port, top rules, reason). Real IPs are shown in the detail block (notification is internal only). IPs are scrubbed before sending to the cloud LLM.
+
+The Teams provider (`notify.py:_send_teams`) sends an Adaptive Card payload matching the existing Power Automate webhook format. Payload shape: `{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","content":{...}}]}`.
+
+## Scheduled task
+
+A Windows Task Scheduler task named `so-ops-correlate` runs every 15 minutes:
+
+```
+so-ops triage --dry-run       # rule-based triage (fast, no LLM), feeds triage.jsonl
+so-ops correlate --lookback-minutes 20   # pattern detection + Gemini brief + Teams notify
+```
+
+Script: `C:\CBScripts\so-ops\run_correlate.ps1` — loads secrets from `.env`, sets `SO_OPS_CONFIG`.
+
+To trigger manually: `Start-ScheduledTask -TaskName "so-ops-correlate"`
+To check status: `Get-ScheduledTaskInfo -TaskName "so-ops-correlate"`
+
+## Correlate tool
+
+`tools/correlate.py` runs in three passes:
+
+**Pass 1 — Alert × alert pattern detection** (no LLM, always runs):
+14 behavioural patterns detected from `triage.jsonl`:
+
+| Pattern | Confidence | Trigger |
+|---|---|---|
+| `scan_to_exploit` | HIGH | same src fires scan + exploit rules |
+| `targeted_host` | HIGH | same dest hit by scan + exploit |
+| `inbound_sweep` | HIGH | external src → 4+ internal hosts |
+| `internal_exploit` | HIGH | internal src → internal dest, high-sev rules |
+| `c2_beacon` | HIGH | 3+ TROJAN/MALWARE rules on same src→dest pair |
+| `lateral_movement` | MEDIUM | src → 4+ distinct internal dests |
+| `port_sweep` | MEDIUM | same src, same port, 3+ hosts |
+| `multi_rule_pair` | MEDIUM | 4+ distinct rules on same src→dest pair |
+| `brute_force` | MEDIUM | 10+ alerts on auth port(s) same pair |
+| `high_volume_src` | MEDIUM/LOW | 30+ alerts from one src |
+| `single_rule_flood` | MEDIUM/LOW | same rule fired 100+ times from one src |
+| `src_ip_pivot` | LOW | src not already flagged, 5+ alerts, 3+ non-INFO categories |
+| `dest_ip_pivot` | LOW | dest not already flagged, 5+ rules, 2+ sources |
+| `dest_port_pivot` | LOW | 3+ distinct srcs, 5+ alerts on same port |
+
+Auth ports for brute_force: 21, 22, 23, 110, 143, 389, 445, 1433, 3306, 3389, 5432, 5900, 5984, 5985, 5986.
+
+Deduplication: high_volume_src skips if scan_to_exploit/lateral_movement already matched that src. inbound_sweep skips if scan_to_exploit matched. src_ip_pivot skips IPs already used as pivot. dest_ip_pivot skips IPs already used as dest pivot. dest_port_pivot skips ports already covered by port_sweep.
+
+Each pattern carries: `pattern_type`, `confidence`, `pivot_ip`, `pivot_role`, `peer_ip`, `dest_ips`, `dest_port`, `rule_names` (up to 20), `categories`, `alert_count`, `time_first`, `time_last`, `recommended_verdict`, `reason`, `community_ids` (up to 10 from matching alerts).
+
+**Pass 2 — Alert × vulnscan cross-reference** (skipped if no scan data):
+Matches alert IPs against nmap XML + nuclei JSONL. Match types (descending confidence): `exact_cve` → `nuclei_cve` → `service_keyword` → `targeted_host`. Recommends verdict upgrades when confidence exceeds current triage verdict. Each vuln finding carries `community_id` from the originating triage alert.
+
+**Pass 3 — LLM analyst brief** (skipped if no HIGH/MEDIUM findings):
+HIGH+MEDIUM patterns + vuln findings are sent to Gemini via OpenRouter. IPs are scrubbed to `INT-001`/`EXT-001` tokens before the cloud call (controlled by `triage.scrub_ips` in config). Returns a prioritised analyst brief. On failure, report and notifications proceed without it.
+
+## triage.jsonl fields
+
+Each line written by `_log_triage_result()`:
+`alert_id`, `alert_timestamp`, `rule_name`, `source_ip`, `dest_ip`, `source_port`, `dest_port`, `protocol`, `community_id`, `verdict`, `confidence`, `method`, `reason`, `escalated`, `correlated_rules`, `notification_sent`
+
+`community_id` is the ECS `network.community_id` field from Suricata — a hash of the 5-tuple. Used by correlate to thread patterns back to the originating flow.
 
 ## Development setup
 
@@ -91,14 +156,18 @@ ruff check src/ tests/     # lint
 ruff format src/ tests/    # format
 ```
 
+**Linter caveat**: ruff runs after every Edit. If you add an import in one edit and the function using it in a separate edit, ruff will remove the import as unused between the two edits. Always add imports in the same edit as the code that uses them.
+
 ## State and logging
 
-Each tool persists a JSON cursor in `data_dir/state/` (configured via `[paths].data_dir`, currently `C:/CBFiles/so-ops-data`). The cursor prevents re-processing alerts already seen.
+Each tool persists a JSON cursor in `data_dir/state/` (configured via `[paths].data_dir`, currently `C:/CBScripts/so-ops-data`). The cursor prevents re-processing alerts already seen.
 
 Logs are written to three destinations simultaneously:
 - stderr
 - Rotating file log in `data_dir/logs/` (5 MB max, 3 backups)
 - Append-only JSONL audit trail in `data_dir/logs/` (never rotated)
+
+Correlate findings are also appended to `data_dir/logs/correlate_findings.jsonl`.
 
 ## Architecture
 
@@ -110,22 +179,26 @@ src/so_ops/
     base.py           — LLMClient Protocol (structural subtyping)
     elasticsearch.py  — urllib + Basic Auth + SSL (no requests)
     ollama.py         — POST to local Ollama REST API
-    openrouter.py     — POST to OpenRouter /chat/completions (NEW)
-    notify.py         — email, Discord, Slack, ntfy, Gotify, SMS, Webhook, Teams (NEW)
+    openrouter.py     — POST to OpenRouter /chat/completions
+    notify.py         — email, Discord, Slack, ntfy, Gotify, SMS, Webhook, Teams
   tools/
     triage.py     — alert triage logic
     health.py     — health report generation
     vulnscan.py   — nmap/nuclei orchestration
+    correlate.py  — 3-pass correlation engine (alert patterns, vuln cross-ref, LLM brief)
 scripts/
-  mock_triage.py  — full end-to-end triage run without Elasticsearch (NEW)
+  mock_triage.py  — full end-to-end triage run without Elasticsearch
+run_correlate.ps1 — scheduled task runner (loads .env, triage --dry-run + correlate)
 ```
 
 ## LLM behavior notes
 
 - Triage uses `llm_temperature = 0.1` (deterministic classification)
 - Health reports use `llm_temperature = 0.3`
+- Correlate LLM brief uses `temperature = 0.3`
 - Network zone context (`[network].internal_prefixes`) is injected into prompts — missing zones degrade classification accuracy
 - Escalation rules in `[triage]` bump verdicts to MEDIUM/HIGH regardless of LLM output; auto-noise signatures skip LLM entirely
+- IPs are scrubbed before any cloud LLM call (`scrub_ips = true` in config)
 
 ## Git
 
