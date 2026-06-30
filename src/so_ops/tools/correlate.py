@@ -69,6 +69,17 @@ _PORT_SWEEP_MIN = 3  # same port on N distinct hosts = port sweep
 _MULTI_RULE_PAIR_MIN = 4  # distinct rules on same src->dest pair = sustained attack
 _HIGH_VOL_MIN = 30  # alerts from one src = high-volume flag
 _C2_RULE_MIN = 3  # distinct TROJAN/MALWARE rules on same pair = C2 pattern
+_INBOUND_SWEEP_MIN = 4  # external src reaching N internal hosts
+_BRUTE_FORCE_MIN = 10  # alerts on auth port from same src->dest pair
+_SINGLE_RULE_FLOOD_MIN = 100  # same src fires same rule N times
+_PIVOT_SRC_CAT_MIN = 3  # distinct non-INFO categories for src_ip_pivot
+_PIVOT_SRC_ALERT_MIN = 5  # min alerts for src_ip_pivot
+_PIVOT_DEST_RULE_MIN = 5  # distinct rules for dest_ip_pivot
+_PIVOT_DEST_SRC_MIN = 2  # distinct src_ips for dest_ip_pivot
+_PIVOT_PORT_SRC_MIN = 3  # distinct src_ips for dest_port_pivot
+_PIVOT_PORT_ALERT_MIN = 5  # min alerts for dest_port_pivot
+
+_AUTH_PORTS = {21, 22, 23, 110, 143, 389, 445, 1433, 3306, 3389, 5432, 5900, 5984, 5985, 5986}
 
 
 def _build_pattern(
@@ -418,6 +429,348 @@ def _correlate_alert_patterns(
                 alert_count=len(src_entries),
                 time_first=times[0] if times else "",
                 time_last=times[-1] if times else "",
+            )
+        )
+
+    # ── Pattern 8: inbound sweep — external src → many internal dests ─────
+    for src_ip, src_entries in by_src.items():
+        if _is_internal(src_ip, internal_prefixes):
+            continue
+        if any(
+            p["pivot_ip"] == src_ip and p["pattern_type"] == "scan_to_exploit" for p in patterns
+        ):
+            continue
+
+        internal_dests = {
+            e["dest_ip"]
+            for e in src_entries
+            if e.get("dest_ip")
+            and e["dest_ip"] != "?"
+            and _is_internal(e["dest_ip"], internal_prefixes)
+        }
+        if len(internal_dests) < _INBOUND_SWEEP_MIN:
+            continue
+
+        rule_names = [e["rule_name"] for e in src_entries]
+        cats = {_rule_category(r) for r in rule_names}
+        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        reason = (
+            f"External IP {src_ip} reached {len(internal_dests)} distinct internal hosts "
+            f"({', '.join(sorted(internal_dests)[:6])}{'...' if len(internal_dests) > 6 else ''}) "
+            f"— internet-originated sweep of internal network segment"
+        )
+        log.info("  INBOUND SWEEP [src=%s]: %d internal targets", src_ip, len(internal_dests))
+        patterns.append(
+            _build_pattern(
+                pattern_type="inbound_sweep",
+                confidence="high",
+                pivot_ip=src_ip,
+                pivot_role="src (external)",
+                reason=reason,
+                recommended_verdict="HIGH",
+                rule_names=rule_names,
+                categories=sorted(cats),
+                alert_count=len(src_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=sorted(internal_dests),
+            )
+        )
+
+    # ── Pattern 9: brute force — repeated alerts on auth ports same pair ──
+    for (src_ip, dest_ip), pair_entries in by_pair.items():
+        auth_entries = [e for e in pair_entries if int(e.get("dest_port", 0) or 0) in _AUTH_PORTS]
+        if len(auth_entries) < _BRUTE_FORCE_MIN:
+            continue
+
+        ports_hit = sorted(
+            {str(e.get("dest_port", "")) for e in auth_entries if e.get("dest_port")}
+        )
+        rule_names = [e["rule_name"] for e in auth_entries]
+        cats = {_rule_category(r) for r in rule_names}
+        times = sorted(e["alert_timestamp"] for e in auth_entries if e.get("alert_timestamp"))
+        reason = (
+            f"{src_ip} -> {dest_ip}: {len(auth_entries)} alerts on auth port(s) "
+            f"{', '.join(ports_hit)} — repeated authentication attempts "
+            f"(brute force / credential stuffing)"
+        )
+        log.info(
+            "  BRUTE FORCE [%s->%s]: %d alerts on auth ports %s",
+            src_ip,
+            dest_ip,
+            len(auth_entries),
+            ports_hit,
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="brute_force",
+                confidence="medium",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                peer_ip=dest_ip,
+                reason=reason,
+                recommended_verdict="MEDIUM",
+                rule_names=rule_names,
+                categories=sorted(cats),
+                alert_count=len(auth_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=[dest_ip],
+                dest_port=ports_hit[0] if len(ports_hit) == 1 else ", ".join(ports_hit),
+            )
+        )
+
+    # ── Pattern 10: single rule flood — same src fires same rule 100+ × ──
+    by_src_rule: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for e in entries:
+        src = e.get("source_ip", "")
+        rule = e.get("rule_name", "")
+        if src and src != "?" and rule:
+            by_src_rule[(src, rule)].append(e)
+
+    for (src_ip, rule_name), flood_entries in by_src_rule.items():
+        if len(flood_entries) < _SINGLE_RULE_FLOOD_MIN:
+            continue
+
+        dest_ips = sorted(
+            {e["dest_ip"] for e in flood_entries if e.get("dest_ip") and e["dest_ip"] != "?"}
+        )
+        dest_ports = sorted(
+            {str(e.get("dest_port", "")) for e in flood_entries if e.get("dest_port")}
+        )
+        times = sorted(e["alert_timestamp"] for e in flood_entries if e.get("alert_timestamp"))
+        cat = _rule_category(rule_name)
+        reason = (
+            f"{src_ip} fired '{rule_name}' {len(flood_entries)} times "
+            f"against {len(dest_ips)} host(s) — repeated identical rule: "
+            f"possible worm, DDoS probe, or misconfigured device"
+        )
+        log.info(
+            "  SINGLE RULE FLOOD [src=%s rule=%.40s]: %d alerts",
+            src_ip,
+            rule_name,
+            len(flood_entries),
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="single_rule_flood",
+                confidence="medium" if cat in _ATTACK_CATS else "low",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                reason=reason,
+                recommended_verdict="MEDIUM" if cat in _ATTACK_CATS else "LOW",
+                rule_names=[rule_name],
+                categories=[cat],
+                alert_count=len(flood_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=dest_ips,
+                dest_port=dest_ports[0] if len(dest_ports) == 1 else "",
+            )
+        )
+
+    # ── Pattern 11: internal→internal exploit ─────────────────────────────
+    flagged_pairs = {
+        (p["pivot_ip"], p["peer_ip"])
+        for p in patterns
+        if p.get("peer_ip") and p["pattern_type"] in ("c2_beacon", "multi_rule_pair")
+    }
+    for (src_ip, dest_ip), pair_entries in by_pair.items():
+        if not _is_internal(src_ip, internal_prefixes):
+            continue
+        if not _is_internal(dest_ip, internal_prefixes):
+            continue
+        if (src_ip, dest_ip) in flagged_pairs:
+            continue
+
+        exploit_entries = [
+            e for e in pair_entries if _rule_category(e["rule_name"]) in _HIGH_SEVERITY_CATS
+        ]
+        if not exploit_entries:
+            continue
+
+        rule_names = [e["rule_name"] for e in exploit_entries]
+        cats = {_rule_category(r) for r in rule_names}
+        times = sorted(e["alert_timestamp"] for e in exploit_entries if e.get("alert_timestamp"))
+        distinct_rules = set(rule_names)
+        reason = (
+            f"Internal host {src_ip} fired {len(distinct_rules)} high-severity rule(s) "
+            f"against internal {dest_ip} ({len(exploit_entries)} alerts) "
+            f"— lateral exploitation attempt within the network"
+        )
+        log.info(
+            "  INTERNAL EXPLOIT [%s->%s]: %d high-sev rules",
+            src_ip,
+            dest_ip,
+            len(distinct_rules),
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="internal_exploit",
+                confidence="high",
+                pivot_ip=src_ip,
+                pivot_role="src (internal)",
+                peer_ip=dest_ip,
+                reason=reason,
+                recommended_verdict="HIGH",
+                rule_names=rule_names,
+                categories=sorted(cats),
+                alert_count=len(exploit_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=[dest_ip],
+            )
+        )
+
+    # ── Field pivot: src_ip — shared source across diverse rules ──────────
+    already_pivoted_src = {
+        p["pivot_ip"]
+        for p in patterns
+        if p["pivot_role"] in ("src", "src (external)", "src (internal)")
+    }
+    for src_ip, src_entries in by_src.items():
+        if src_ip in already_pivoted_src:
+            continue
+        if len(src_entries) < _PIVOT_SRC_ALERT_MIN:
+            continue
+
+        non_info_cats = {_rule_category(e["rule_name"]) for e in src_entries} - {"info", "policy"}
+        if len(non_info_cats) < _PIVOT_SRC_CAT_MIN:
+            continue
+
+        dest_ips = sorted(
+            {e["dest_ip"] for e in src_entries if e.get("dest_ip") and e["dest_ip"] != "?"}
+        )
+        rule_names = sorted({e["rule_name"] for e in src_entries})
+        all_cats = {_rule_category(e["rule_name"]) for e in src_entries}
+        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        reason = (
+            f"{src_ip} is the source IP across {len(src_entries)} alerts "
+            f"spanning {len(rule_names)} rules in {len(non_info_cats)} non-INFO categories "
+            f"({', '.join(sorted(non_info_cats))}) targeting {len(dest_ips)} host(s)"
+        )
+        log.info(
+            "  SRC PIVOT [src=%s]: %d alerts, %d categories",
+            src_ip,
+            len(src_entries),
+            len(non_info_cats),
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="src_ip_pivot",
+                confidence="low",
+                pivot_ip=src_ip,
+                pivot_role="src",
+                reason=reason,
+                recommended_verdict="LOW",
+                rule_names=rule_names[:20],
+                categories=sorted(all_cats),
+                alert_count=len(src_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=dest_ips,
+            )
+        )
+
+    # ── Field pivot: dest_ip — shared dest targeted by many rules/sources ─
+    already_pivoted_dest = {p["pivot_ip"] for p in patterns if p["pivot_role"] == "dest"}
+    for dest_ip, dest_entries in by_dest.items():
+        if dest_ip in already_pivoted_dest:
+            continue
+
+        distinct_rules = {e["rule_name"] for e in dest_entries}
+        distinct_srcs = {
+            e["source_ip"] for e in dest_entries if e.get("source_ip") and e["source_ip"] != "?"
+        }
+        if len(distinct_rules) < _PIVOT_DEST_RULE_MIN or len(distinct_srcs) < _PIVOT_DEST_SRC_MIN:
+            continue
+
+        cats = {_rule_category(r) for r in distinct_rules}
+        times = sorted(e["alert_timestamp"] for e in dest_entries if e.get("alert_timestamp"))
+        reason = (
+            f"{dest_ip} is the destination across {len(dest_entries)} alerts "
+            f"spanning {len(distinct_rules)} distinct rules from {len(distinct_srcs)} source(s) "
+            f"— this host is being targeted from multiple angles"
+        )
+        log.info(
+            "  DEST PIVOT [dest=%s]: %d rules from %d sources",
+            dest_ip,
+            len(distinct_rules),
+            len(distinct_srcs),
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="dest_ip_pivot",
+                confidence="low",
+                pivot_ip=dest_ip,
+                pivot_role="dest",
+                reason=reason,
+                recommended_verdict="LOW",
+                rule_names=sorted(distinct_rules)[:20],
+                categories=sorted(cats),
+                alert_count=len(dest_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=[dest_ip],
+            )
+        )
+
+    # ── Field pivot: dest_port — same port targeted by many sources ────────
+    by_dest_port: dict[str, list[dict]] = defaultdict(list)
+    for e in entries:
+        port = str(e.get("dest_port", ""))
+        if port and port != "?":
+            by_dest_port[port].append(e)
+
+    already_swept_ports = {p["dest_port"] for p in patterns if p["pattern_type"] == "port_sweep"}
+    for port, port_entries in by_dest_port.items():
+        if port in already_swept_ports:
+            continue
+
+        distinct_srcs = {
+            e["source_ip"] for e in port_entries if e.get("source_ip") and e["source_ip"] != "?"
+        }
+        if len(distinct_srcs) < _PIVOT_PORT_SRC_MIN or len(port_entries) < _PIVOT_PORT_ALERT_MIN:
+            continue
+
+        non_info = [
+            e for e in port_entries if _rule_category(e["rule_name"]) not in ("info", "policy")
+        ]
+        if not non_info:
+            continue
+
+        dest_ips = sorted(
+            {e["dest_ip"] for e in port_entries if e.get("dest_ip") and e["dest_ip"] != "?"}
+        )
+        rule_names = sorted({e["rule_name"] for e in port_entries})
+        cats = {_rule_category(r) for r in rule_names}
+        times = sorted(e["alert_timestamp"] for e in port_entries if e.get("alert_timestamp"))
+        reason = (
+            f"Port {port} is the destination port across {len(port_entries)} alerts "
+            f"from {len(distinct_srcs)} distinct source(s) targeting {len(dest_ips)} host(s) "
+            f"— possible service-specific attack or coordinated scan"
+        )
+        log.info(
+            "  PORT PIVOT [port=%s]: %d alerts from %d sources",
+            port,
+            len(port_entries),
+            len(distinct_srcs),
+        )
+        patterns.append(
+            _build_pattern(
+                pattern_type="dest_port_pivot",
+                confidence="low",
+                pivot_ip="",
+                pivot_role="port",
+                reason=reason,
+                recommended_verdict="LOW",
+                rule_names=rule_names[:20],
+                categories=sorted(cats),
+                alert_count=len(port_entries),
+                time_first=times[0] if times else "",
+                time_last=times[-1] if times else "",
+                dest_ips=dest_ips,
+                dest_port=port,
             )
         )
 
@@ -879,21 +1232,32 @@ def _build_report(
             "multi_rule_pair": "Sustained multi-rule attack (same pair)",
             "c2_beacon": "C2 / beaconing (TROJAN/MALWARE rules)",
             "high_volume_src": "High-volume source",
+            "inbound_sweep": "Inbound sweep (external → many internal hosts)",
+            "brute_force": "Brute force / credential attack",
+            "single_rule_flood": "Single-rule flood (repeated identical alert)",
+            "internal_exploit": "Internal→internal exploitation",
+            "src_ip_pivot": "Source IP pivot (shared origin across rules)",
+            "dest_ip_pivot": "Destination IP pivot (shared target across sources)",
+            "dest_port_pivot": "Destination port pivot (shared port across sources)",
         }
 
         for p in high_p + med_p + low_p:
             label = _pattern_labels.get(p["pattern_type"], p["pattern_type"])
             lines.append(f"## [{p['confidence'].upper()}] {label}")
-            lines.append(f"- **Pivot IP:** `{p['pivot_ip']}` (as {p['pivot_role']})")
+            if p["pivot_ip"] and p["pivot_role"] != "port":
+                lines.append(f"- **Pivot IP:** `{p['pivot_ip']}` (as {p['pivot_role']})")
             if p["peer_ip"]:
                 lines.append(f"- **Peer IP:** `{p['peer_ip']}`")
+            if p["dest_port"] and p["pivot_role"] == "port":
+                lines.append(f"- **Pivot port:** `{p['dest_port']}`")
             if p["dest_ips"] and p["dest_ips"] != [p["pivot_ip"]]:
                 shown = p["dest_ips"][:12]
                 more = f" +{len(p['dest_ips']) - 12} more" if len(p["dest_ips"]) > 12 else ""
+                host_label = "Source IPs" if p["pivot_role"] == "port" else "Involved hosts"
                 lines.append(
-                    f"- **Involved hosts ({len(p['dest_ips'])}):** {', '.join(f'`{ip}`' for ip in shown)}{more}"
+                    f"- **{host_label} ({len(p['dest_ips'])}):** {', '.join(f'`{ip}`' for ip in shown)}{more}"
                 )
-            if p["dest_port"]:
+            if p["dest_port"] and p["pivot_role"] != "port":
                 lines.append(f"- **Target port:** `{p['dest_port']}`")
             lines.append(f"- **Recommended verdict:** {p['recommended_verdict']}")
             lines.append(f"- **Alert count:** {p['alert_count']}")
