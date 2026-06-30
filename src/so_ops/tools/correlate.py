@@ -1699,11 +1699,37 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
     med_count = sum(1 for p in patterns if p["confidence"] == "medium")
     changes = [f for f in vuln_findings if f["verdict_changed"]]
 
-    if llm_brief and (high_count or med_count or changes):
+    if high_count or med_count or changes:
         notify_title = f"[so-ops] Correlation: {high_count} high / {med_count} medium patterns"
-        notify_body = llm_brief.strip()
-        notify_short = f"{high_count} HIGH + {med_count} MEDIUM patterns detected"
-        notify_all(cfg.notifications, notify_title, notify_body, short=notify_short)
+
+        # Pattern detail block appended after the AI brief
+        detail_lines: list[str] = []
+        for p in patterns:
+            if p["confidence"] not in ("high", "medium"):
+                continue
+            detail_lines.append(
+                f"[{p['confidence'].upper()}] {p['pattern_type'].upper()}"
+                f" | {p['alert_count']} alerts"
+                f" | {p['time_first'][:16]} - {p['time_last'][:16]}"
+            )
+            if p.get("pivot_ip"):
+                detail_lines.append(f"  Pivot: {p['pivot_ip']} ({p.get('pivot_role', '?')})")
+            if p.get("peer_ip"):
+                detail_lines.append(f"  Peer: {p['peer_ip']}")
+            if p.get("dest_ips"):
+                detail_lines.append(f"  Targets: {', '.join(p['dest_ips'][:5])}")
+            if p.get("dest_port"):
+                detail_lines.append(f"  Port: {p['dest_port']}")
+            for rule in p.get("rule_names", [])[:5]:
+                detail_lines.append(f"  Rule: {rule}")
+            detail_lines.append(f"  Reason: {p.get('reason', '')}")
+            detail_lines.append("")
+
+        detail_block = "\n".join(detail_lines).strip()
+        notify_body = (
+            (llm_brief.strip() + "\n\n---\n\n" + detail_block) if llm_brief else detail_block
+        )
+        notify_all(cfg.notifications, notify_title, notify_body)
         log.info("Notification sent")
 
     # ── Console summary ───────────────────────────────────────────────
