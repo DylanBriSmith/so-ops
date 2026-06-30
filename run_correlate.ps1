@@ -12,5 +12,5 @@
 $env:SO_OPS_CONFIG = "C:\CBScripts\so-ops\config.toml"
 
 # Run triage first (LLM classifies new alerts), then correlate on last 20 min
-so-ops triage
+so-ops triage --dry-run
 so-ops correlate --lookback-minutes 20
