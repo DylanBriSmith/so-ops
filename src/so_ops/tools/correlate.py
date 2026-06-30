@@ -129,6 +129,15 @@ def _build_pattern(
     }
 
 
+def _cids(entries: list[dict]) -> list[str]:
+    return [e.get("community_id", "") for e in entries if e.get("community_id")]
+
+
+def _time_range(entries: list[dict]) -> tuple[str, str]:
+    times = sorted(e["alert_timestamp"] for e in entries if e.get("alert_timestamp"))
+    return (times[0] if times else ""), (times[-1] if times else "")
+
+
 def _correlate_alert_patterns(
     entries: list[dict],
     internal_prefixes: list[str],
@@ -185,7 +194,7 @@ def _correlate_alert_patterns(
             for e in src_entries
             if _rule_category(e["rule_name"]) in _HIGH_SEVERITY_CATS
         ]
-        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(src_entries)
         dest_ips = sorted(
             {e["dest_ip"] for e in src_entries if e.get("dest_ip") and e["dest_ip"] != "?"}
         )
@@ -213,12 +222,10 @@ def _correlate_alert_patterns(
                 rule_names=scan_rules + exploit_rules,
                 categories=sorted(cats & (_SCAN_CATS | _HIGH_SEVERITY_CATS)),
                 alert_count=len(src_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=dest_ips,
-                community_ids=[
-                    e.get("community_id", "") for e in src_entries if e.get("community_id")
-                ],
+                community_ids=_cids(src_entries),
             )
         )
 
@@ -234,7 +241,7 @@ def _correlate_alert_patterns(
             {e["source_ip"] for e in dest_entries if e.get("source_ip") and e["source_ip"] != "?"}
         )
         rule_names = [e["rule_name"] for e in dest_entries]
-        times = sorted(e["alert_timestamp"] for e in dest_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(dest_entries)
 
         reason = (
             f"{dest_ip} was targeted by both SCAN and high-severity rules "
@@ -252,12 +259,10 @@ def _correlate_alert_patterns(
                 rule_names=rule_names,
                 categories=sorted(cats & (_SCAN_CATS | _HIGH_SEVERITY_CATS)),
                 alert_count=len(dest_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=[dest_ip],
-                community_ids=[
-                    e.get("community_id", "") for e in dest_entries if e.get("community_id")
-                ],
+                community_ids=_cids(dest_entries),
             )
         )
 
@@ -275,7 +280,7 @@ def _correlate_alert_patterns(
 
         rule_names = [e["rule_name"] for e in src_entries]
         cats = {_rule_category(r) for r in rule_names}
-        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(src_entries)
         src_internal = _is_internal(src_ip, internal_prefixes)
         role_note = "internal source" if src_internal else "external source"
 
@@ -295,12 +300,10 @@ def _correlate_alert_patterns(
                 rule_names=rule_names,
                 categories=sorted(cats),
                 alert_count=len(src_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=sorted(internal_dests),
-                community_ids=[
-                    e.get("community_id", "") for e in src_entries if e.get("community_id")
-                ],
+                community_ids=_cids(src_entries),
             )
         )
 
@@ -322,7 +325,7 @@ def _correlate_alert_patterns(
 
         rule_names = [e["rule_name"] for e in port_entries]
         cats = {_rule_category(r) for r in rule_names}
-        times = sorted(e["alert_timestamp"] for e in port_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(port_entries)
 
         reason = (
             f"{src_ip} hit port {port} on {len(distinct_dests)} distinct hosts "
@@ -341,13 +344,11 @@ def _correlate_alert_patterns(
                 rule_names=rule_names,
                 categories=sorted(cats),
                 alert_count=len(port_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=sorted(distinct_dests),
                 dest_port=port,
-                community_ids=[
-                    e.get("community_id", "") for e in port_entries if e.get("community_id")
-                ],
+                community_ids=_cids(port_entries),
             )
         )
 
@@ -358,7 +359,7 @@ def _correlate_alert_patterns(
             continue
 
         cats = {_rule_category(r) for r in distinct_rules}
-        times = sorted(e["alert_timestamp"] for e in pair_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(pair_entries)
 
         reason = (
             f"{src_ip} → {dest_ip}: {len(distinct_rules)} distinct rules fired "
@@ -381,12 +382,10 @@ def _correlate_alert_patterns(
                 rule_names=sorted(distinct_rules),
                 categories=sorted(cats),
                 alert_count=len(pair_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=[dest_ip],
-                community_ids=[
-                    e.get("community_id", "") for e in pair_entries if e.get("community_id")
-                ],
+                community_ids=_cids(pair_entries),
             )
         )
 
@@ -399,7 +398,7 @@ def _correlate_alert_patterns(
         if len(distinct_c2_rules) < _C2_RULE_MIN:
             continue
 
-        times = sorted(e["alert_timestamp"] for e in c2_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(c2_entries)
         cats = {_rule_category(e["rule_name"]) for e in c2_entries}
 
         reason = (
@@ -421,16 +420,20 @@ def _correlate_alert_patterns(
                 rule_names=sorted(distinct_c2_rules),
                 categories=sorted(cats),
                 alert_count=len(c2_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=[dest_ip],
-                community_ids=[
-                    e.get("community_id", "") for e in c2_entries if e.get("community_id")
-                ],
+                community_ids=_cids(c2_entries),
             )
         )
 
     # ── Pattern 7: high-volume single source ───────────────────────────
+    _flagged_srcs = {
+        p["pivot_ip"]
+        for p in patterns
+        if p["pattern_type"] in ("scan_to_exploit", "lateral_movement")
+    }
+    _scan_exploit_srcs = {p["pivot_ip"] for p in patterns if p["pattern_type"] == "scan_to_exploit"}
     for src_ip, src_entries in by_src.items():
         if len(src_entries) < high_vol_min:
             continue
@@ -438,14 +441,10 @@ def _correlate_alert_patterns(
         distinct_rules = {e["rule_name"] for e in src_entries}
         cats = {_rule_category(r) for r in distinct_rules}
         # Skip if already caught by scan→exploit or lateral movement
-        already_flagged = any(
-            p["pivot_ip"] == src_ip and p["pattern_type"] in ("scan_to_exploit", "lateral_movement")
-            for p in patterns
-        )
-        if already_flagged:
+        if src_ip in _flagged_srcs:
             continue
 
-        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(src_entries)
         has_attack_cat = bool(cats & _ATTACK_CATS)
 
         reason = (
@@ -469,11 +468,9 @@ def _correlate_alert_patterns(
                 rule_names=sorted(distinct_rules)[:20],
                 categories=sorted(cats),
                 alert_count=len(src_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
-                community_ids=[
-                    e.get("community_id", "") for e in src_entries if e.get("community_id")
-                ],
+                time_first=time_first,
+                time_last=time_last,
+                community_ids=_cids(src_entries),
             )
         )
 
@@ -481,9 +478,7 @@ def _correlate_alert_patterns(
     for src_ip, src_entries in by_src.items():
         if _is_internal(src_ip, internal_prefixes):
             continue
-        if any(
-            p["pivot_ip"] == src_ip and p["pattern_type"] == "scan_to_exploit" for p in patterns
-        ):
+        if src_ip in _scan_exploit_srcs:
             continue
 
         internal_dests = {
@@ -498,7 +493,7 @@ def _correlate_alert_patterns(
 
         rule_names = [e["rule_name"] for e in src_entries]
         cats = {_rule_category(r) for r in rule_names}
-        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(src_entries)
         reason = (
             f"External IP {src_ip} reached {len(internal_dests)} distinct internal hosts "
             f"({', '.join(sorted(internal_dests)[:6])}{'...' if len(internal_dests) > 6 else ''}) "
@@ -516,12 +511,10 @@ def _correlate_alert_patterns(
                 rule_names=rule_names,
                 categories=sorted(cats),
                 alert_count=len(src_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=sorted(internal_dests),
-                community_ids=[
-                    e.get("community_id", "") for e in src_entries if e.get("community_id")
-                ],
+                community_ids=_cids(src_entries),
             )
         )
 
@@ -536,7 +529,7 @@ def _correlate_alert_patterns(
         )
         rule_names = [e["rule_name"] for e in auth_entries]
         cats = {_rule_category(r) for r in rule_names}
-        times = sorted(e["alert_timestamp"] for e in auth_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(auth_entries)
         reason = (
             f"{src_ip} -> {dest_ip}: {len(auth_entries)} alerts on auth port(s) "
             f"{', '.join(ports_hit)} — repeated authentication attempts "
@@ -561,13 +554,11 @@ def _correlate_alert_patterns(
                 rule_names=rule_names,
                 categories=sorted(cats),
                 alert_count=len(auth_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=[dest_ip],
                 dest_port=ports_hit[0] if len(ports_hit) == 1 else ", ".join(ports_hit),
-                community_ids=[
-                    e.get("community_id", "") for e in auth_entries if e.get("community_id")
-                ],
+                community_ids=_cids(auth_entries),
             )
         )
 
@@ -589,7 +580,7 @@ def _correlate_alert_patterns(
         dest_ports = sorted(
             {str(e.get("dest_port", "")) for e in flood_entries if e.get("dest_port")}
         )
-        times = sorted(e["alert_timestamp"] for e in flood_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(flood_entries)
         cat = _rule_category(rule_name)
         reason = (
             f"{src_ip} fired '{rule_name}' {len(flood_entries)} times "
@@ -613,13 +604,11 @@ def _correlate_alert_patterns(
                 rule_names=[rule_name],
                 categories=[cat],
                 alert_count=len(flood_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=dest_ips,
                 dest_port=dest_ports[0] if len(dest_ports) == 1 else "",
-                community_ids=[
-                    e.get("community_id", "") for e in flood_entries if e.get("community_id")
-                ],
+                community_ids=_cids(flood_entries),
             )
         )
 
@@ -645,7 +634,7 @@ def _correlate_alert_patterns(
 
         rule_names = [e["rule_name"] for e in exploit_entries]
         cats = {_rule_category(r) for r in rule_names}
-        times = sorted(e["alert_timestamp"] for e in exploit_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(exploit_entries)
         distinct_rules = set(rule_names)
         reason = (
             f"Internal host {src_ip} fired {len(distinct_rules)} high-severity rule(s) "
@@ -670,12 +659,10 @@ def _correlate_alert_patterns(
                 rule_names=rule_names,
                 categories=sorted(cats),
                 alert_count=len(exploit_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=[dest_ip],
-                community_ids=[
-                    e.get("community_id", "") for e in exploit_entries if e.get("community_id")
-                ],
+                community_ids=_cids(exploit_entries),
             )
         )
 
@@ -700,7 +687,7 @@ def _correlate_alert_patterns(
         )
         rule_names = sorted({e["rule_name"] for e in src_entries})
         all_cats = {_rule_category(e["rule_name"]) for e in src_entries}
-        times = sorted(e["alert_timestamp"] for e in src_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(src_entries)
         reason = (
             f"{src_ip} is the source IP across {len(src_entries)} alerts "
             f"spanning {len(rule_names)} rules in {len(non_info_cats)} non-INFO categories "
@@ -723,12 +710,10 @@ def _correlate_alert_patterns(
                 rule_names=rule_names[:20],
                 categories=sorted(all_cats),
                 alert_count=len(src_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=dest_ips,
-                community_ids=[
-                    e.get("community_id", "") for e in src_entries if e.get("community_id")
-                ],
+                community_ids=_cids(src_entries),
             )
         )
 
@@ -746,7 +731,7 @@ def _correlate_alert_patterns(
             continue
 
         cats = {_rule_category(r) for r in distinct_rules}
-        times = sorted(e["alert_timestamp"] for e in dest_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(dest_entries)
         reason = (
             f"{dest_ip} is the destination across {len(dest_entries)} alerts "
             f"spanning {len(distinct_rules)} distinct rules from {len(distinct_srcs)} source(s) "
@@ -769,12 +754,10 @@ def _correlate_alert_patterns(
                 rule_names=sorted(distinct_rules)[:20],
                 categories=sorted(cats),
                 alert_count=len(dest_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=[dest_ip],
-                community_ids=[
-                    e.get("community_id", "") for e in dest_entries if e.get("community_id")
-                ],
+                community_ids=_cids(dest_entries),
             )
         )
 
@@ -807,7 +790,7 @@ def _correlate_alert_patterns(
         )
         rule_names = sorted({e["rule_name"] for e in port_entries})
         cats = {_rule_category(r) for r in rule_names}
-        times = sorted(e["alert_timestamp"] for e in port_entries if e.get("alert_timestamp"))
+        time_first, time_last = _time_range(port_entries)
         reason = (
             f"Port {port} is the destination port across {len(port_entries)} alerts "
             f"from {len(distinct_srcs)} distinct source(s) targeting {len(dest_ips)} host(s) "
@@ -830,13 +813,11 @@ def _correlate_alert_patterns(
                 rule_names=rule_names[:20],
                 categories=sorted(cats),
                 alert_count=len(port_entries),
-                time_first=times[0] if times else "",
-                time_last=times[-1] if times else "",
+                time_first=time_first,
+                time_last=time_last,
                 dest_ips=dest_ips,
                 dest_port=port,
-                community_ids=[
-                    e.get("community_id", "") for e in port_entries if e.get("community_id")
-                ],
+                community_ids=_cids(port_entries),
             )
         )
 
@@ -1247,6 +1228,24 @@ def _correlate_vuln(
 # ── Report ────────────────────────────────────────────────────────────────────
 
 
+_pattern_labels = {
+    "scan_to_exploit": "SCAN→EXPLOIT chain",
+    "targeted_host": "Host targeted (scan + exploit)",
+    "lateral_movement": "Lateral movement / internal sweep",
+    "port_sweep": "Port sweep (same port, many hosts)",
+    "multi_rule_pair": "Sustained multi-rule attack (same pair)",
+    "c2_beacon": "C2 / beaconing (TROJAN/MALWARE rules)",
+    "high_volume_src": "High-volume source",
+    "inbound_sweep": "Inbound sweep (external → many internal hosts)",
+    "brute_force": "Brute force / credential attack",
+    "single_rule_flood": "Single-rule flood (repeated identical alert)",
+    "internal_exploit": "Internal→internal exploitation",
+    "src_ip_pivot": "Source IP pivot (shared origin across rules)",
+    "dest_ip_pivot": "Destination IP pivot (shared target across sources)",
+    "dest_port_pivot": "Destination port pivot (shared port across sources)",
+}
+
+
 def _build_report(
     patterns: list[dict],
     vuln_findings: list[dict],
@@ -1304,23 +1303,6 @@ def _build_report(
     # ── Alert patterns ─────────────────────────────────────────────────
     if patterns:
         lines += ["---", "# Alert Behaviour Patterns", ""]
-        _pattern_labels = {
-            "scan_to_exploit": "SCAN→EXPLOIT chain",
-            "targeted_host": "Host targeted (scan + exploit)",
-            "lateral_movement": "Lateral movement / internal sweep",
-            "port_sweep": "Port sweep (same port, many hosts)",
-            "multi_rule_pair": "Sustained multi-rule attack (same pair)",
-            "c2_beacon": "C2 / beaconing (TROJAN/MALWARE rules)",
-            "high_volume_src": "High-volume source",
-            "inbound_sweep": "Inbound sweep (external → many internal hosts)",
-            "brute_force": "Brute force / credential attack",
-            "single_rule_flood": "Single-rule flood (repeated identical alert)",
-            "internal_exploit": "Internal→internal exploitation",
-            "src_ip_pivot": "Source IP pivot (shared origin across rules)",
-            "dest_ip_pivot": "Destination IP pivot (shared target across sources)",
-            "dest_port_pivot": "Destination port pivot (shared port across sources)",
-        }
-
         for p in high_p + med_p + low_p:
             label = _pattern_labels.get(p["pattern_type"], p["pattern_type"])
             lines.append(f"## [{p['confidence'].upper()}] {label}")
@@ -1572,6 +1554,24 @@ def _summarize_with_llm(
         return None
 
 
+_con_labels = {
+    "scan_to_exploit": "SCAN->EXPLOIT",
+    "targeted_host": "TARGETED HOST",
+    "c2_beacon": "C2 BEACON",
+    "inbound_sweep": "INBOUND SWEEP",
+    "internal_exploit": "INTERNAL EXPLOIT",
+    "brute_force": "BRUTE FORCE",
+    "single_rule_flood": "RULE FLOOD",
+    "lateral_movement": "LATERAL MOVEMENT",
+    "port_sweep": "PORT SWEEP",
+    "multi_rule_pair": "MULTI-RULE PAIR",
+    "high_volume_src": "HIGH VOLUME",
+    "src_ip_pivot": "SRC PIVOT",
+    "dest_ip_pivot": "DEST PIVOT",
+    "dest_port_pivot": "PORT PIVOT",
+}
+
+
 def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int | None = None):
     # lookback_minutes overrides lookback_hours when provided
     if lookback_minutes is not None:
@@ -1609,23 +1609,24 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
         return
 
     total = skipped = 0
-    for line in triage_jsonl.read_text(encoding="utf-8").strip().split("\n"):
-        if not line.strip():
-            continue
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        total += 1
-        ts_str = e.get("alert_timestamp", "")
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            if ts < cutoff:
-                skipped += 1
+    with open(triage_jsonl, encoding="utf-8") as _fh:
+        for line in _fh:
+            if not line.strip():
                 continue
-        except (ValueError, TypeError):
-            pass
-        entries.append(e)
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            total += 1
+            ts_str = e.get("alert_timestamp", "")
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if ts < cutoff:
+                    skipped += 1
+                    continue
+            except (ValueError, TypeError):
+                pass
+            entries.append(e)
 
     log.info("Triage log: %d total, %d in window, %d skipped", total, len(entries), skipped)
 
@@ -1684,8 +1685,8 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
     # ── Write JSONL log ───────────────────────────────────────────────
     findings_log = log_dir / "correlate_findings.jsonl"
     all_findings = patterns + vuln_findings
-    for item in all_findings:
-        with open(findings_log, "a", encoding="utf-8") as fh:
+    with open(findings_log, "a", encoding="utf-8") as fh:
+        for item in all_findings:
             fh.write(json.dumps(item) + "\n")
     log.info("Wrote %d findings to %s", len(all_findings), findings_log)
 
@@ -1784,23 +1785,6 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
         f"{sum(1 for f in vuln_findings if f['confidence'] == 'low')} low)"
     )
     print(f"Verdict upgrades: {len(changes)}")
-
-    _con_labels = {
-        "scan_to_exploit": "SCAN->EXPLOIT",
-        "targeted_host": "TARGETED HOST",
-        "c2_beacon": "C2 BEACON",
-        "inbound_sweep": "INBOUND SWEEP",
-        "internal_exploit": "INTERNAL EXPLOIT",
-        "brute_force": "BRUTE FORCE",
-        "single_rule_flood": "RULE FLOOD",
-        "lateral_movement": "LATERAL MOVEMENT",
-        "port_sweep": "PORT SWEEP",
-        "multi_rule_pair": "MULTI-RULE PAIR",
-        "high_volume_src": "HIGH VOLUME",
-        "src_ip_pivot": "SRC PIVOT",
-        "dest_ip_pivot": "DEST PIVOT",
-        "dest_port_pivot": "PORT PIVOT",
-    }
 
     if high_p:
         print("\nHIGH CONFIDENCE PATTERNS:")

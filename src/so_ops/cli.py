@@ -63,11 +63,7 @@ def cmd_config_check(args, cfg):
 def cmd_correlate(args, cfg):
     from so_ops.tools.correlate import run_correlate
 
-    minutes = getattr(args, "lookback_minutes", None)
-    if minutes is not None:
-        run_correlate(cfg, lookback_minutes=minutes)
-    else:
-        run_correlate(cfg, lookback_hours=args.lookback_hours)
+    run_correlate(cfg, lookback_hours=args.lookback_hours, lookback_minutes=args.lookback_minutes)
 
 
 def cmd_test_notify(args, cfg):

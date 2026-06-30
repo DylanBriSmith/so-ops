@@ -685,11 +685,9 @@ def run_triage(cfg: Config, dry_run: bool = False):
                     all_results.append(entry)
 
         # Update cursor only on live runs so dry run can be repeated
+        since = hits[-1]["_source"]["@timestamp"]
         if not dry_run:
-            since = hits[-1]["_source"]["@timestamp"]
             state.set_cursor("last_timestamp", since)
-        else:
-            since = hits[-1]["_source"]["@timestamp"]
 
         if len(hits) < cfg.triage.max_alerts_per_query:
             break
