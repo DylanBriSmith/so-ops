@@ -233,57 +233,97 @@ def _build_report(
         "",
     ]
 
+    # Build per-host CVE lookup for the per-host section
+    vulns_by_host: dict[str, list] = {}
+    for v in vulns:
+        vulns_by_host.setdefault(v["host"], []).append(v)
+
+    nuclei_by_host: dict[str, list] = {}
+    for nf in nuclei_findings:
+        # extract bare IP from matched_at URL
+        ip_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", nf.get("matched_at", ""))
+        ip = ip_match.group(1) if ip_match else nf.get("matched_at", "")
+        nuclei_by_host.setdefault(ip, []).append(nf)
+
     if hosts:
-        lines.append("## Host/Service Inventory")
+        lines.append("## Host Inventory & Findings")
         lines.append("")
         for h in hosts:
             name = f" ({h['hostname']})" if h["hostname"] else ""
-            lines.append(f"### {h['ip']}{name}")
-            for p in h["ports"]:
-                product = f" - {p['product']}" if p["product"] else ""
-                lines.append(f"  - {p['port']}: {p['service']}{product}")
+            host_cves = vulns_by_host.get(h["ip"], [])
+            host_nuclei = nuclei_by_host.get(h["ip"], [])
+            crit = [v for v in host_cves if v["cvss"] >= 9.0]
+            hi = [v for v in host_cves if 7.0 <= v["cvss"] < 9.0]
+            med = [v for v in host_cves if 4.0 <= v["cvss"] < 7.0]
+
+            risk = (
+                "CRITICAL" if crit else "HIGH" if hi else "MEDIUM" if med or host_nuclei else "LOW"
+            )
+            lines.append(f"### {h['ip']}{name}  `[{risk}]`")
             lines.append("")
+            lines.append("**Open services:**")
+            for p in h["ports"]:
+                product = f" — {p['product']}" if p["product"] else ""
+                lines.append(f"  - `{p['port']}` {p['service']}{product}")
+            lines.append("")
+
+            if host_cves:
+                lines.append(
+                    f"**CVEs ({len(host_cves)} total — {len(crit)} critical, {len(hi)} high, {len(med)} medium):**"
+                )
+                for v in host_cves[:30]:
+                    sev_tag = (
+                        "CRITICAL"
+                        if v["cvss"] >= 9.0
+                        else "HIGH"
+                        if v["cvss"] >= 7.0
+                        else "MEDIUM"
+                        if v["cvss"] >= 4.0
+                        else "LOW"
+                    )
+                    lines.append(
+                        f"  - `[{sev_tag} {v['cvss']}]` **{v['cve']}** on port `{v['port']}` ({v['service']})"
+                    )
+                if len(host_cves) > 30:
+                    lines.append(f"  - *(+{len(host_cves) - 30} more — see raw nmap XML)*")
+                lines.append("")
+
+            if host_nuclei:
+                lines.append(f"**Nuclei findings ({len(host_nuclei)}):**")
+                for nf in host_nuclei:
+                    cve_tag = f" `{nf['cve_id']}`" if nf.get("cve_id") else ""
+                    lines.append(
+                        f"  - `[{nf['severity'].upper()}]` **{nf['name']}**{cve_tag} at `{nf['matched_at']}`"
+                    )
+                    if nf.get("description"):
+                        lines.append(f"    {nf['description'][:120]}")
+                lines.append("")
+
+            if not host_cves and not host_nuclei:
+                lines.append("*No vulnerabilities detected on this host.*")
+                lines.append("")
 
     if vulns:
         critical = [v for v in vulns if v["cvss"] >= 9.0]
         high = [v for v in vulns if 7.0 <= v["cvss"] < 9.0]
         medium = [v for v in vulns if 4.0 <= v["cvss"] < 7.0]
 
-        lines.append("## CVE Vulnerabilities (nmap/vulners)")
-        lines.append(f"  - Critical (CVSS >= 9.0): {len(critical)}")
-        lines.append(f"  - High (CVSS 7.0-8.9): {len(high)}")
-        lines.append(f"  - Medium (CVSS 4.0-6.9): {len(medium)}")
+        lines.append("## CVE Summary")
+        lines.append(f"  - **Critical** (CVSS >= 9.0): {len(critical)}")
+        lines.append(f"  - **High** (CVSS 7.0-8.9): {len(high)}")
+        lines.append(f"  - **Medium** (CVSS 4.0-6.9): {len(medium)}")
         lines.append("")
 
-        if critical:
-            lines.append("### Critical CVEs")
-            for v in critical[:20]:
-                lines.append(
-                    f"  - **{v['cve']}** (CVSS {v['cvss']}) on {v['host']}:{v['port']} ({v['service']})"
-                )
-            lines.append("")
-
-        if high:
-            lines.append("### High CVEs")
-            for v in high[:30]:
-                lines.append(
-                    f"  - {v['cve']} (CVSS {v['cvss']}) on {v['host']}:{v['port']} ({v['service']})"
-                )
-            lines.append("")
-
     if nuclei_findings:
-        lines.append("## Nuclei Findings")
+        lines.append("## Nuclei Summary")
         by_severity: dict[str, list] = {}
         for f in nuclei_findings:
             by_severity.setdefault(f["severity"], []).append(f)
         for sev in ("critical", "high", "medium"):
             items = by_severity.get(sev, [])
             if items:
-                lines.append(f"### {sev.upper()} ({len(items)})")
-                for item in items[:20]:
-                    cve = f" [{item['cve_id']}]" if item["cve_id"] else ""
-                    lines.append(f"  - **{item['name']}**{cve} at {item['matched_at']}")
-                lines.append("")
+                lines.append(f"  - **{sev.upper()}**: {len(items)}")
+        lines.append("")
 
     if not vulns and not nuclei_findings:
         lines.append("## No vulnerabilities found")

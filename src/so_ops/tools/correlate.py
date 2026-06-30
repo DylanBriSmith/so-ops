@@ -888,22 +888,53 @@ def _build_report(
             if p["peer_ip"]:
                 lines.append(f"- **Peer IP:** `{p['peer_ip']}`")
             if p["dest_ips"] and p["dest_ips"] != [p["pivot_ip"]]:
-                shown = p["dest_ips"][:8]
-                more = f" +{len(p['dest_ips']) - 8} more" if len(p["dest_ips"]) > 8 else ""
-                lines.append(f"- **Involved hosts:** {', '.join(f'`{ip}`' for ip in shown)}{more}")
+                shown = p["dest_ips"][:12]
+                more = f" +{len(p['dest_ips']) - 12} more" if len(p["dest_ips"]) > 12 else ""
+                lines.append(
+                    f"- **Involved hosts ({len(p['dest_ips'])}):** {', '.join(f'`{ip}`' for ip in shown)}{more}"
+                )
             if p["dest_port"]:
-                lines.append(f"- **Port:** {p['dest_port']}")
+                lines.append(f"- **Target port:** `{p['dest_port']}`")
             lines.append(f"- **Recommended verdict:** {p['recommended_verdict']}")
             lines.append(f"- **Alert count:** {p['alert_count']}")
             if p["time_first"] and p["time_last"]:
-                lines.append(f"- **Window:** {p['time_first'][:19]} → {p['time_last'][:19]}")
-            lines.append(f"- **Categories:** {', '.join(p['categories'])}")
-            lines.append(f"- **Rules ({len(p['rule_names'])}):**")
-            for r in p["rule_names"][:10]:
-                lines.append(f"  - {r}")
-            if len(p["rule_names"]) > 10:
-                lines.append(f"  - *(+{len(p['rule_names']) - 10} more)*")
-            lines.append(f"- **Reason:** {p['reason']}")
+                lines.append(
+                    f"- **Window:** `{p['time_first'][:19]}` to `{p['time_last'][:19]} UTC`"
+                )
+            lines.append(f"- **Rule categories seen:** {', '.join(p['categories'])}")
+            lines.append(f"- **Why this matched:** {p['reason']}")
+            lines.append("")
+
+            # Break down rules by category for clarity
+            rule_names = p["rule_names"]
+            by_cat: dict[str, list[str]] = {}
+            for r in rule_names:
+                cat = _rule_category(r)
+                by_cat.setdefault(cat, []).append(r)
+
+            cat_order = [
+                "exploit",
+                "trojan",
+                "malware",
+                "shellcode",
+                "attack",
+                "scan",
+                "dos",
+                "web_server",
+                "web_client",
+                "info",
+                "policy",
+                "other",
+            ]
+            for cat in cat_order:
+                rs = by_cat.get(cat, [])
+                if not rs:
+                    continue
+                lines.append(f"  **{cat.upper()} rules ({len(rs)}):**")
+                for r in rs[:15]:
+                    lines.append(f"  - `{r}`")
+                if len(rs) > 15:
+                    lines.append(f"  - *(+{len(rs) - 15} more)*")
             lines.append("")
 
     # ── Vuln correlations ──────────────────────────────────────────────

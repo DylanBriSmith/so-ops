@@ -416,34 +416,75 @@ def _generate_summary(
         lines.append(f"- **{v}**: {count} ({pct:.1f}%) {bar}")
     lines.append("")
 
+    def _fmt_alert_group(r_list: list) -> list[str]:
+        """Return detail lines for a group of alerts sharing a rule_name."""
+        out = []
+        by_rule: dict[str, list] = defaultdict(list)
+        for r in r_list:
+            by_rule[r["rule_name"]].append(r)
+        for rule, items in sorted(by_rule.items(), key=lambda x: -len(x[1])):
+            src_ips = sorted(
+                {r["source_ip"] for r in items if r.get("source_ip") and r["source_ip"] != "?"}
+            )
+            dst_ips = sorted(
+                {r["dest_ip"] for r in items if r.get("dest_ip") and r["dest_ip"] != "?"}
+            )
+            dst_ports = sorted(
+                {
+                    str(r["dest_port"])
+                    for r in items
+                    if r.get("dest_port") and str(r["dest_port"]) != "?"
+                }
+            )
+            method = items[0].get("method", "?")
+            reason = items[0].get("reason", "")
+            rec = items[0].get("recommendation", "")
+            out.append(f"### {rule}")
+            out.append(f"- **Alerts:** {len(items)}  |  **Method:** {method}")
+            out.append(
+                f"- **Sources:** {', '.join(src_ips[:10])}{'...' if len(src_ips) > 10 else ''}"
+            )
+            out.append(
+                f"- **Targets:** {', '.join(dst_ips[:10])}{'...' if len(dst_ips) > 10 else ''}"
+                + (f"  port(s): {', '.join(dst_ports[:5])}" if dst_ports else "")
+            )
+            out.append(f"- **Classification:** {reason}")
+            if rec and rec != "Dry run — no action taken":
+                out.append(f"- **Action:** {rec}")
+            out.append("")
+        return out
+
     if verdict_groups.get("HIGH"):
         lines.append("## HIGH Priority - Investigate Immediately")
-        for r in verdict_groups["HIGH"]:
-            lines.append(
-                f"- **{r['rule_name']}** | {r['source_ip']} -> {r['dest_ip']}:{r['dest_port']}"
-            )
-            lines.append(f"  - Reason: {r['reason']}")
-            lines.append(f"  - Action: {r['recommendation']}")
         lines.append("")
+        lines += _fmt_alert_group(verdict_groups["HIGH"])
 
     if verdict_groups.get("MEDIUM"):
         lines.append("## MEDIUM Priority - Investigate When Convenient")
-        for r in verdict_groups["MEDIUM"]:
-            lines.append(
-                f"- **{r['rule_name']}** | {r['source_ip']} -> {r['dest_ip']}:{r['dest_port']}"
-            )
-            lines.append(f"  - Reason: {r['reason']}")
-            lines.append(f"  - Action: {r['recommendation']}")
         lines.append("")
+        lines += _fmt_alert_group(verdict_groups["MEDIUM"])
 
     if verdict_groups.get("LOW"):
         lines.append("## LOW Priority - FYI")
+        lines.append("")
         low_by_rule: dict[str, list] = defaultdict(list)
         for r in verdict_groups["LOW"]:
             low_by_rule[r["rule_name"]].append(r)
-        for rule, items in low_by_rule.items():
-            lines.append(f"- **{rule}**: {len(items)} alerts")
-            if items[0]["reason"]:
+        for rule, items in sorted(low_by_rule.items(), key=lambda x: -len(x[1])):
+            src_ips = sorted(
+                {r["source_ip"] for r in items if r.get("source_ip") and r["source_ip"] != "?"}
+            )
+            dst_ips = sorted(
+                {r["dest_ip"] for r in items if r.get("dest_ip") and r["dest_ip"] != "?"}
+            )
+            lines.append(f"- **{rule}** ({len(items)} alerts)")
+            lines.append(
+                f"  - Sources: {', '.join(src_ips[:8])}{'...' if len(src_ips) > 8 else ''}"
+            )
+            lines.append(
+                f"  - Targets: {', '.join(dst_ips[:8])}{'...' if len(dst_ips) > 8 else ''}"
+            )
+            if items[0].get("reason"):
                 lines.append(f"  - {items[0]['reason']}")
         lines.append("")
 
