@@ -34,7 +34,7 @@ def cmd_status(args, cfg):
     from so_ops.state import ToolState
 
     state_dir = cfg.paths.data_dir / "state"
-    for tool in ("triage", "health", "vulnscan"):
+    for tool in ("triage", "health", "vulnscan", "correlate"):
         st = ToolState(tool, state_dir)
         print(f"{tool:10s}: {st.as_status_line()}")
 
@@ -58,6 +58,12 @@ def cmd_config_check(args, cfg):
         print(f"  Net zones:    {len(cfg.network.zones)} configured")
         for z in cfg.network.zones:
             print(f"                {z.cidr} = {z.name}")
+
+
+def cmd_correlate(args, cfg):
+    from so_ops.tools.correlate import run_correlate
+
+    run_correlate(cfg, lookback_hours=args.lookback_hours)
 
 
 def cmd_test_notify(args, cfg):
@@ -98,6 +104,17 @@ def main():
         "--type", choices=["nmap", "nuclei", "all"], default="all", help="Scan type (default: all)"
     )
 
+    p_correlate = sub.add_parser(
+        "correlate", help="Cross-reference triage alerts with vulnscan results (no LLM)"
+    )
+    p_correlate.add_argument(
+        "--lookback-hours",
+        type=int,
+        default=48,
+        metavar="N",
+        help="Hours of triage history to check (default: 48)",
+    )
+
     sub.add_parser("status", help="Show last run times/results")
     sub.add_parser("config-check", help="Validate config.toml")
     sub.add_parser("test-notify", help="Send test notification to all enabled providers")
@@ -127,6 +144,7 @@ def main():
         "triage": cmd_triage,
         "health": cmd_health,
         "scan": cmd_scan,
+        "correlate": cmd_correlate,
         "status": cmd_status,
         "config-check": cmd_config_check,
         "test-notify": cmd_test_notify,
