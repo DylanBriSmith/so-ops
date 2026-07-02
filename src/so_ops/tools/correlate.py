@@ -27,7 +27,12 @@ from so_ops.tools.correlate_vuln import (
 )
 
 
-def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int | None = None):
+def run_correlate(
+    cfg: Config,
+    lookback_hours: int = 48,
+    lookback_minutes: int | None = None,
+    skip_vuln: bool = False,
+):
     # lookback_minutes overrides lookback_hours when provided
     if lookback_minutes is not None:
         _lookback = timedelta(minutes=lookback_minutes)
@@ -108,8 +113,11 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
     nmap_index: dict[str, dict] = {}
     nuclei_index: dict[str, list[dict]] = {}
     nmap_xml = nuclei_jsonl = None
+    vuln_findings: list[dict] = []
 
-    if scan_dir.exists():
+    if skip_vuln:
+        log.info("Pass 2 skipped — --skip-vuln")
+    elif scan_dir.exists():
         nmap_xml = find_latest_file(scan_dir, "nmap_*.xml")
         nuclei_jsonl = find_latest_file(scan_dir, "nuclei_*.jsonl")
         if nmap_xml:
@@ -119,8 +127,7 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
     else:
         log.info("No vulnscan output dir — skipping vuln correlation (run 'so-ops scan' first)")
 
-    vuln_findings: list[dict] = []
-    if nmap_index or nuclei_index:
+    if not skip_vuln and (nmap_index or nuclei_index):
         log.info(
             "=== Pass 2: vuln correlation (%d nmap, %d nuclei hosts) ===",
             len(nmap_index),
@@ -134,7 +141,7 @@ def run_correlate(cfg: Config, lookback_hours: int = 48, lookback_minutes: int |
             sum(1 for f in vuln_findings if f["confidence"] == "medium"),
             sum(1 for f in vuln_findings if f["confidence"] == "low"),
         )
-    else:
+    elif not skip_vuln:
         log.info("Pass 2 skipped — no scan data available")
 
     # ── Write JSONL log ───────────────────────────────────────────────

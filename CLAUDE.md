@@ -92,11 +92,14 @@ The Teams provider (`notify.py:_send_teams`) sends an Adaptive Card payload matc
 
 ## Scheduled task
 
+**Team guide:** see [docs/15-minute-check.md](docs/15-minute-check.md) for a plain-language walkthrough of what runs every 15 minutes.
+
 A Windows Task Scheduler task named `so-ops-correlate` runs every 15 minutes:
 
 ```
 so-ops triage --dry-run       # rule-based triage (fast, no LLM), feeds triage.jsonl
 so-ops correlate --lookback-minutes 20   # pattern detection + Gemini brief + Teams notify
+so-ops correlate --lookback-minutes 20 --skip-vuln   # same, without nmap/nuclei cross-reference
 ```
 
 Script: `C:\CBScripts\so-ops\run_correlate.ps1` — loads secrets from `.env`, sets `SO_OPS_CONFIG`.

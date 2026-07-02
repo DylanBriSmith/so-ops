@@ -63,7 +63,12 @@ def cmd_config_check(args, cfg):
 def cmd_correlate(args, cfg):
     from so_ops.tools.correlate import run_correlate
 
-    run_correlate(cfg, lookback_hours=args.lookback_hours, lookback_minutes=args.lookback_minutes)
+    run_correlate(
+        cfg,
+        lookback_hours=args.lookback_hours,
+        lookback_minutes=args.lookback_minutes,
+        skip_vuln=args.skip_vuln,
+    )
 
 
 def cmd_test_notify(args, cfg):
@@ -121,6 +126,11 @@ def main():
         default=None,
         metavar="N",
         help="Minutes of triage history to check (overrides --lookback-hours)",
+    )
+    p_correlate.add_argument(
+        "--skip-vuln",
+        action="store_true",
+        help="Skip Pass 2 vulnscan cross-reference (nmap/nuclei)",
     )
 
     sub.add_parser("status", help="Show last run times/results")
