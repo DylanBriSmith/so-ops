@@ -1,4 +1,12 @@
-"""Alert triage: query Suricata alerts, classify with LLM, notify on HIGH."""
+"""Alert triage: query Suricata alerts, classify with LLM, notify on HIGH.
+
+Flow (see run_triage at the bottom):
+  1. Fetch new alerts from Elasticsearch since last cursor
+  2. Auto-noise — skip LLM for known benign signatures
+  3. Classify remaining alerts (LLM, or rule-based in --dry-run)
+  4. Write results to triage.jsonl and generate a markdown summary
+  5. Notify on HIGH verdicts (and high/critical Sigma detections)
+"""
 
 from __future__ import annotations
 
@@ -15,6 +23,9 @@ from so_ops.clients.notify import notify_all
 from so_ops.config import Config
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
+
+
+# ── Flow grouping (same connection) ───────────────────────────────────────────
 
 
 def _flow_key(alert: dict) -> tuple:
@@ -71,6 +82,9 @@ def _correlated_escalation(
     return verdict, ""
 
 
+# ── Elasticsearch → alert dict ────────────────────────────────────────────────
+
+
 def _extract_alert_summary(hit: dict) -> dict:
     """Extract key fields from an ES alert hit into a concise dict."""
     src = hit["_source"]
@@ -107,6 +121,9 @@ def _extract_alert_summary(hit: dict) -> dict:
     }
 
 
+# ── Auto-noise and grouping ───────────────────────────────────────────────────
+
+
 def _classify_auto_noise(alerts: list, noise_sigs: set) -> tuple[list, list]:
     """Separate known-noise alerts from those needing LLM review."""
     noise, needs_review = [], []
@@ -128,6 +145,9 @@ def _group_alerts(alerts: list) -> dict[str, list]:
         key = f"{alert['rule_name']}|{alert['source_ip']}"
         groups[key].append(alert)
     return dict(groups)
+
+
+# ── LLM prompt building ───────────────────────────────────────────────────────
 
 
 def _build_zone_context(zones, scrub_zones: bool = True) -> str:
@@ -255,6 +275,9 @@ Respond in this exact JSON format (no other text):
     return prompt, ip_map
 
 
+# ── Escalation and LLM classification ─────────────────────────────────────────
+
+
 def _enforce_minimum_severity(
     rule_name: str, verdict: str, min_medium: list[str], min_high: list[str]
 ) -> str:
@@ -348,6 +371,9 @@ def _triage_with_llm(
             f.write(json.dumps(entry) + "\n")
 
     return verdict_info
+
+
+# ── Logging and summary output ────────────────────────────────────────────────
 
 
 def _log_triage_result(alert: dict, verdict_info: dict, jsonl_path: Path) -> dict:
@@ -515,6 +541,9 @@ def _generate_summary(
     summary_dir.mkdir(parents=True, exist_ok=True)
     summary_file.write_text(summary_text)
     return summary_file, summary_text
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def run_triage(cfg: Config, dry_run: bool = False):
