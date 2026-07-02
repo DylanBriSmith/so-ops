@@ -12,7 +12,7 @@ try:
 except ImportError:
     import xml.etree.ElementTree as ET  # type: ignore[no-redef]
 
-from so_ops.tools.correlate_common import verdict_rank
+from so_ops.tools.correlate_common import confidence_rank, is_exploit_rule, verdict_rank
 
 # ── Vulnscan data loading ─────────────────────────────────────────────────────
 
@@ -36,17 +36,6 @@ _SERVICE_KEYWORDS: list[tuple[str, list[str]]] = [
     ("redis", ["Redis"]),
     ("mongodb", ["MongoDB"]),
 ]
-
-_EXPLOIT_RULE_PREFIXES = (
-    "ET EXPLOIT",
-    "ET TROJAN",
-    "ET MALWARE",
-    "ET ATTACK",
-    "ET SHELLCODE",
-    "GPL EXPLOIT",
-    "GPL SHELLCODE",
-    "GPL ATTACK",
-)
 
 MATCH_EXACT_CVE = "exact_cve"
 MATCH_NUCLEI_CVE = "nuclei_cve"
@@ -177,10 +166,6 @@ def load_nuclei_index(jsonl_path: Path, log) -> dict[str, list[dict]]:
 
 def _cves_in_rule(rule_name: str) -> list[str]:
     return re.findall(r"CVE-\d{4}-\d+", rule_name, re.IGNORECASE)
-
-
-def _is_exploit_rule(rule_name: str) -> bool:
-    return any(rule_name.startswith(p) for p in _EXPLOIT_RULE_PREFIXES)
 
 
 def _svc_keywords_match(rule_name: str, services: list[str]) -> list[str]:
@@ -318,7 +303,7 @@ def _correlate_one_ip_vuln(
             )
             matched = True
             continue
-        if nf["severity"] in ("critical", "high") and not matched and _is_exploit_rule(rule_name):
+        if nf["severity"] in ("critical", "high") and not matched and is_exploit_rule(rule_name):
             reason = (
                 f"Exploit rule involving {ip} where nuclei confirmed "
                 f"'{nf['name']}' ({nf['severity']}) at {nf['matched_at']} [{role}]"
@@ -355,7 +340,7 @@ def _correlate_one_ip_vuln(
             )
             matched = True
 
-    if not matched and host_info and host_info["cves"] and _is_exploit_rule(rule_name):
+    if not matched and host_info and host_info["cves"] and is_exploit_rule(rule_name):
         top = host_info["cves"][0]
         reason = (
             f"Exploit rule involving {ip} ({role}) which has {len(host_info['cves'])} known CVEs "
@@ -402,10 +387,9 @@ def correlate_vuln(
                     seen.add(key)
                     findings.append(f)
 
-    order_conf = {"high": 0, "medium": 1, "low": 2}
     findings.sort(
         key=lambda f: (
-            order_conf.get(f["confidence"], 9),
+            confidence_rank(f["confidence"]),
             -verdict_rank(f["recommended_verdict"]),
         )
     )

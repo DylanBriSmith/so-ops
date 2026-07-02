@@ -4,27 +4,29 @@ from __future__ import annotations
 
 from so_ops.clients import make_llm_client
 from so_ops.config import Config
-from so_ops.tools.correlate_common import rule_category
+from so_ops.tools.correlate_common import REPORT_CATEGORY_ORDER, rule_category
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-
-_pattern_labels = {
-    "scan_to_exploit": "SCAN→EXPLOIT chain",
-    "targeted_host": "Host targeted (scan + exploit)",
-    "lateral_movement": "Lateral movement / internal sweep",
-    "port_sweep": "Port sweep (same port, many hosts)",
-    "multi_rule_pair": "Sustained multi-rule attack (same pair)",
-    "c2_beacon": "C2 / beaconing (TROJAN/MALWARE rules)",
-    "high_volume_src": "High-volume source",
-    "inbound_sweep": "Inbound sweep (external → many internal hosts)",
-    "brute_force": "Brute force / credential attack",
-    "single_rule_flood": "Single-rule flood (repeated identical alert)",
-    "internal_exploit": "Internal→internal exploitation",
-    "src_ip_pivot": "Source IP pivot (shared origin across rules)",
-    "dest_ip_pivot": "Destination IP pivot (shared target across sources)",
-    "dest_port_pivot": "Destination port pivot (shared port across sources)",
+# (markdown_label, console_label) — keep in sync with pattern_type in correlate_patterns.py
+PATTERN_LABELS: dict[str, tuple[str, str]] = {
+    "scan_to_exploit": ("SCAN→EXPLOIT chain", "SCAN->EXPLOIT"),
+    "targeted_host": ("Host targeted (scan + exploit)", "TARGETED HOST"),
+    "lateral_movement": ("Lateral movement / internal sweep", "LATERAL MOVEMENT"),
+    "port_sweep": ("Port sweep (same port, many hosts)", "PORT SWEEP"),
+    "multi_rule_pair": ("Sustained multi-rule attack (same pair)", "MULTI-RULE PAIR"),
+    "c2_beacon": ("C2 / beaconing (TROJAN/MALWARE rules)", "C2 BEACON"),
+    "high_volume_src": ("High-volume source", "HIGH VOLUME"),
+    "inbound_sweep": ("Inbound sweep (external → many internal hosts)", "INBOUND SWEEP"),
+    "brute_force": ("Brute force / credential attack", "BRUTE FORCE"),
+    "single_rule_flood": ("Single-rule flood (repeated identical alert)", "RULE FLOOD"),
+    "internal_exploit": ("Internal→internal exploitation", "INTERNAL EXPLOIT"),
+    "src_ip_pivot": ("Source IP pivot (shared origin across rules)", "SRC PIVOT"),
+    "dest_ip_pivot": ("Destination IP pivot (shared target across sources)", "DEST PIVOT"),
+    "dest_port_pivot": ("Destination port pivot (shared port across sources)", "PORT PIVOT"),
 }
+
+CONSOLE_PATTERN_LABELS = {k: labels[1] for k, labels in PATTERN_LABELS.items()}
 
 
 def build_report(
@@ -85,7 +87,7 @@ def build_report(
     if patterns:
         lines += ["---", "# Alert Behaviour Patterns", ""]
         for p in high_p + med_p + low_p:
-            label = _pattern_labels.get(p["pattern_type"], p["pattern_type"])
+            label = PATTERN_LABELS.get(p["pattern_type"], (p["pattern_type"],))[0]
             lines.append(f"## [{p['confidence'].upper()}] {label}")
             if p["pivot_ip"] and p["pivot_role"] != "port":
                 lines.append(f"- **Pivot IP:** `{p['pivot_ip']}` (as {p['pivot_role']})")
@@ -119,21 +121,7 @@ def build_report(
                 cat = rule_category(r)
                 by_cat.setdefault(cat, []).append(r)
 
-            cat_order = [
-                "exploit",
-                "trojan",
-                "malware",
-                "shellcode",
-                "attack",
-                "scan",
-                "dos",
-                "web_server",
-                "web_client",
-                "info",
-                "policy",
-                "other",
-            ]
-            for cat in cat_order:
+            for cat in REPORT_CATEGORY_ORDER:
                 rs = by_cat.get(cat, [])
                 if not rs:
                     continue
@@ -333,19 +321,3 @@ def summarize_with_llm(
     except Exception as exc:
         log.warning("LLM brief failed (%s) — report will proceed without it", exc)
         return None
-CONSOLE_PATTERN_LABELS = {
-    "scan_to_exploit": "SCAN->EXPLOIT",
-    "targeted_host": "TARGETED HOST",
-    "c2_beacon": "C2 BEACON",
-    "inbound_sweep": "INBOUND SWEEP",
-    "internal_exploit": "INTERNAL EXPLOIT",
-    "brute_force": "BRUTE FORCE",
-    "single_rule_flood": "RULE FLOOD",
-    "lateral_movement": "LATERAL MOVEMENT",
-    "port_sweep": "PORT SWEEP",
-    "multi_rule_pair": "MULTI-RULE PAIR",
-    "high_volume_src": "HIGH VOLUME",
-    "src_ip_pivot": "SRC PIVOT",
-    "dest_ip_pivot": "DEST PIVOT",
-    "dest_port_pivot": "PORT PIVOT",
-}
