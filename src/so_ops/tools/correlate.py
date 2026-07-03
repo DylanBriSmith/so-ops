@@ -68,7 +68,7 @@ def run_correlate(
         state.finish_run(correlations=0)
         return
 
-    total = skipped = 0
+    total = skipped_old = skipped_noise = 0
     with open(triage_jsonl, encoding="utf-8") as _fh:
         for line in _fh:
             if not line.strip():
@@ -78,17 +78,26 @@ def run_correlate(
             except json.JSONDecodeError:
                 continue
             total += 1
+            if e.get("verdict") == "NOISE":
+                skipped_noise += 1
+                continue
             ts_str = e.get("alert_timestamp", "")
             try:
                 ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                 if ts < cutoff:
-                    skipped += 1
+                    skipped_old += 1
                     continue
             except (ValueError, TypeError):
                 pass
             entries.append(e)
 
-    log.info("Triage log: %d total, %d in window, %d skipped", total, len(entries), skipped)
+    log.info(
+        "Triage log: %d total, %d in window, %d skipped (outside window), %d skipped (noise)",
+        total,
+        len(entries),
+        skipped_old,
+        skipped_noise,
+    )
 
     if not entries:
         log.warning("No alerts in last %s", _lookback_label)

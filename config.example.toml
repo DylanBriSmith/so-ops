@@ -125,6 +125,7 @@ signatures = [
     "ET INFO Session Traversal Utilities for NAT (STUN Binding Response)",
     "ET INFO Session Traversal Utilities for NAT (STUN Binding Request On Non-Standard High Port)",
     "ET INFO Microsoft Connection Test",
+    "ET VOIP Multiple Unauthorized SIP Responses UDP",
 ]
 
 # Signature prefixes that force a minimum severity regardless of LLM verdict.
@@ -153,7 +154,7 @@ targets = [
     "192.168.0.0/24",    # example: server VLAN
     "192.168.1.0/24",    # example: workstation VLAN
 ]
-nmap_bin = "/usr/bin/nmap"
+nmap_bin = "C:/Program Files (x86)/Nmap/nmap.exe"   # Windows; Linux: /usr/bin/nmap
 nmap_args = "-sV --script=vulners -T4 --open"
 nuclei_docker = "projectdiscovery/nuclei:latest"
 nuclei_severity = "medium,high,critical"
