@@ -58,9 +58,9 @@ def run_correlate(
     run_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     log.info("=== Starting correlation run: %s ===", run_time)
-    log.info("Triage lookback: %s", _lookback_label)
+    log.info("Triage lookback (rules): %s", _lookback_label)
 
-    # ── Load triage log ───────────────────────────────────────────────
+    # ── Load triage log (rule window) ─────────────────────────────────
     triage_jsonl = log_dir / "triage.jsonl"
     cutoff = datetime.now(timezone.utc) - _lookback
 
@@ -72,7 +72,7 @@ def run_correlate(
 
     entries, load_stats = load_triage_entries(triage_jsonl, cutoff)
     log.info(
-        "Triage log: %d total, %d in window, %d skipped (outside window), "
+        "Rule window: %d total lines, %d unique alerts, %d skipped (outside window), "
         "%d skipped (noise), %d skipped (invalid), %d skipped (no alert_id)",
         load_stats["total"],
         load_stats["in_window"],
@@ -83,10 +83,8 @@ def run_correlate(
     )
 
     if not entries:
-        log.warning("No alerts in last %s", _lookback_label)
-        print(f"No triage alerts in the last {_lookback_label}.")
-        state.finish_run(correlations=0)
-        return
+        log.warning("No alerts in rule window (%s) — Pass 1-3 will be empty", _lookback_label)
+        print(f"No triage alerts in rule window ({_lookback_label}). Pass 4 may still run.")
 
     # ── Pass 1: alert × alert patterns ───────────────────────────────
     log.info("=== Pass 1: alert pattern detection (%d alerts) ===", len(entries))
@@ -153,7 +151,7 @@ def run_correlate(
     # ── Pass 4: LLM triage review (grouped HIGH/MEDIUM, T-1 + T-0) ───
     log.info("=== Pass 4: LLM triage review ===")
     summary_dir = data_dir / "output" / "triage" / "summaries"
-    triage_llm = run_triage_llm_review(entries, cfg, log, summary_dir)
+    triage_llm = run_triage_llm_review(triage_jsonl, cfg, log, summary_dir)
     triage_llm_brief = triage_llm.brief
 
     # ── Build report ──────────────────────────────────────────────────
@@ -246,7 +244,7 @@ def run_correlate(
     print("\n" + "=" * 60)
     print("CORRELATION COMPLETE")
     print("=" * 60)
-    print(f"Alerts analysed:  {len(entries)} (last {_lookback_label})")
+    print(f"Alerts analysed:  {len(entries)} (rule window {_lookback_label})")
     print(
         f"Alert patterns:   {len(patterns)} "
         f"({high_count} high / {med_count} medium / "

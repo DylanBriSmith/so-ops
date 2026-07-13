@@ -8,7 +8,7 @@ from pathlib import Path
 
 from so_ops.clients import make_llm_client
 from so_ops.config import Config
-from so_ops.tools.correlate_common import parse_alert_timestamp
+from so_ops.tools.correlate_common import load_triage_entries, parse_alert_timestamp
 from so_ops.tools.correlate_ip import (
     build_ip_map,
     collect_ips_from_entries,
@@ -192,17 +192,38 @@ def summarize_triage_with_llm(
 
 
 def run_triage_llm_review(
-    entries: list[dict],
+    triage_jsonl: Path,
     cfg: Config,
     log,
     summary_dir: Path,
     n_runs: int = 2,
 ) -> TriageLlmResult:
-    """Pass 4: group HIGH/MEDIUM triage and request an independent LLM brief."""
+    """Pass 4: group HIGH/MEDIUM triage from the last n dry-runs and call LLM."""
     windows = load_last_n_run_windows(summary_dir, n=n_runs)
     if not windows:
         log.info("Triage LLM: no dryrun summaries found — skipping")
         return TriageLlmResult(None, 0, 0, 0)
+
+    llm_cutoff = windows[0].start
+    log.info(
+        "Triage LLM: loading last %d run(s) from %s (since %s)",
+        len(windows),
+        triage_jsonl.name,
+        llm_cutoff.strftime("%Y-%m-%d %H:%M UTC"),
+    )
+    if not triage_jsonl.exists():
+        log.warning("Triage LLM: no triage log at %s — skipping", triage_jsonl)
+        return TriageLlmResult(None, 0, 0, 0)
+
+    entries, load_stats = load_triage_entries(triage_jsonl, llm_cutoff)
+    log.info(
+        "Triage LLM load: %d in run window(s), %d skipped (outside), "
+        "%d skipped (noise), %d skipped (invalid)",
+        load_stats["in_window"],
+        load_stats["skipped_old"],
+        load_stats["skipped_noise"],
+        load_stats["skipped_invalid"],
+    )
 
     digest = build_grouped_digest(entries, windows)
     high_n = sum(1 for g in digest if g["verdict"] == "HIGH")

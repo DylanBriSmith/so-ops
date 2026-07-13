@@ -19,4 +19,4 @@ if (Test-Path $EnvFile) {
 $env:SO_OPS_CONFIG = "C:\CBScripts\so-ops\config.toml"
 
 so-ops triage --dry-run
-so-ops correlate --lookback-minutes 30 --skip-vuln
+so-ops correlate --lookback-minutes 20 --skip-vuln
