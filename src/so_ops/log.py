@@ -71,8 +71,8 @@ def setup_logging(tool_name: str, log_dir: Path) -> logging.Logger:
     file_h.setFormatter(fmt)
     logger.addHandler(file_h)
 
-    # 3. JSONL audit trail
-    jsonl_h = JsonlHandler(log_dir / f"{tool_name}.jsonl")
+    # 3. JSONL audit trail (separate from tool result logs e.g. triage.jsonl)
+    jsonl_h = JsonlHandler(log_dir / f"{tool_name}_audit.jsonl")
     jsonl_h.setLevel(logging.INFO)
     logger.addHandler(jsonl_h)
 

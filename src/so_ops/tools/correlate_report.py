@@ -5,6 +5,12 @@ from __future__ import annotations
 from so_ops.clients import make_llm_client
 from so_ops.config import Config
 from so_ops.tools.correlate_common import REPORT_CATEGORY_ORDER, rule_category
+from so_ops.tools.correlate_ip import (
+    build_ip_map,
+    collect_ips_from_patterns,
+    collect_ips_from_vuln_findings,
+    scrub_text,
+)
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
@@ -40,6 +46,7 @@ def build_report(
     nuclei_file: str,
     run_time: str,
     llm_brief: str | None = None,
+    triage_llm_brief: str | None = None,
 ) -> str:
     high_p = [p for p in patterns if p["confidence"] == "high"]
     med_p = [p for p in patterns if p["confidence"] == "medium"]
@@ -61,9 +68,18 @@ def build_report(
     if llm_brief:
         lines += [
             "---",
-            "# Analyst Brief (AI)",
+            "# Analyst Brief — Rule Patterns (AI)",
             "",
             llm_brief.strip(),
+            "",
+        ]
+
+    if triage_llm_brief:
+        lines += [
+            "---",
+            "# Analyst Brief — Triage Review (AI)",
+            "",
+            triage_llm_brief.strip(),
             "",
         ]
 
@@ -214,35 +230,18 @@ def summarize_with_llm(
 
     # Build IP scrubbing map
     all_ips: set[str] = set()
-    for p in high_med_patterns:
-        if p.get("pivot_ip"):
-            all_ips.add(p["pivot_ip"])
-        if p.get("peer_ip"):
-            all_ips.add(p["peer_ip"])
-        all_ips.update(p.get("dest_ips", []))
-    for f in high_med_vulns:
-        for field in ("source_ip", "dest_ip", "matched_ip"):
-            if f.get(field):
-                all_ips.add(f[field])
+    all_ips.update(collect_ips_from_patterns(high_med_patterns))
+    all_ips.update(collect_ips_from_vuln_findings(high_med_vulns))
 
     internal_prefixes = cfg.network.internal_prefixes
     scrub = getattr(getattr(cfg, "triage", None), "scrub_ips", True)
 
     ip_map: dict[str, str] = {}
     if scrub:
-        int_n = ext_n = 0
-        for ip in sorted(all_ips):
-            if any(ip.startswith(px) for px in internal_prefixes):
-                int_n += 1
-                ip_map[ip] = f"INT-{int_n:03d}"
-            else:
-                ext_n += 1
-                ip_map[ip] = f"EXT-{ext_n:03d}"
+        ip_map = build_ip_map(all_ips, internal_prefixes)
 
     def _s(text: str) -> str:
-        for real, token in ip_map.items():
-            text = text.replace(real, token)
-        return text
+        return scrub_text(text, ip_map)
 
     # Build prompt
     prompt_lines = [

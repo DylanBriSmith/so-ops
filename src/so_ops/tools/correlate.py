@@ -1,9 +1,10 @@
 """Alert correlation orchestrator.
 
-Reads triage.jsonl and runs three passes:
+Reads triage.jsonl and runs four passes:
   1. correlate_patterns  — behavioural pattern detection (no LLM)
   2. correlate_vuln      — cross-reference with nmap/nuclei scans
-  3. correlate_report    — markdown report + optional LLM brief + notify
+  3. correlate_report    — markdown report + LLM brief on rule patterns
+  4. correlate_triage_llm — independent LLM review of grouped triage (T-1 + T-0)
 
 Implementation lives in correlate_*.py modules alongside this file.
 """
@@ -17,8 +18,10 @@ from so_ops.clients.notify import notify_all
 from so_ops.config import Config
 from so_ops.log import setup_logging
 from so_ops.state import ToolState
+from so_ops.tools.correlate_common import load_triage_entries
 from so_ops.tools.correlate_patterns import correlate_alert_patterns
 from so_ops.tools.correlate_report import CONSOLE_PATTERN_LABELS, build_report, summarize_with_llm
+from so_ops.tools.correlate_triage_llm import run_triage_llm_review
 from so_ops.tools.correlate_vuln import (
     correlate_vuln,
     find_latest_file,
@@ -59,7 +62,6 @@ def run_correlate(
 
     # ── Load triage log ───────────────────────────────────────────────
     triage_jsonl = log_dir / "triage.jsonl"
-    entries: list[dict] = []
     cutoff = datetime.now(timezone.utc) - _lookback
 
     if not triage_jsonl.exists():
@@ -68,35 +70,16 @@ def run_correlate(
         state.finish_run(correlations=0)
         return
 
-    total = skipped_old = skipped_noise = 0
-    with open(triage_jsonl, encoding="utf-8") as _fh:
-        for line in _fh:
-            if not line.strip():
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            total += 1
-            if e.get("verdict") == "NOISE":
-                skipped_noise += 1
-                continue
-            ts_str = e.get("alert_timestamp", "")
-            try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                if ts < cutoff:
-                    skipped_old += 1
-                    continue
-            except (ValueError, TypeError):
-                pass
-            entries.append(e)
-
+    entries, load_stats = load_triage_entries(triage_jsonl, cutoff)
     log.info(
-        "Triage log: %d total, %d in window, %d skipped (outside window), %d skipped (noise)",
-        total,
-        len(entries),
-        skipped_old,
-        skipped_noise,
+        "Triage log: %d total, %d in window, %d skipped (outside window), "
+        "%d skipped (noise), %d skipped (invalid), %d skipped (no alert_id)",
+        load_stats["total"],
+        load_stats["in_window"],
+        load_stats["skipped_old"],
+        load_stats["skipped_noise"],
+        load_stats["skipped_invalid"],
+        load_stats["skipped_no_id"],
     )
 
     if not entries:
@@ -161,11 +144,17 @@ def run_correlate(
             fh.write(json.dumps(item) + "\n")
     log.info("Wrote %d findings to %s", len(all_findings), findings_log)
 
-    # ── Pass 3: LLM analyst brief ─────────────────────────────────────
-    log.info("=== Pass 3: LLM analyst brief ===")
+    # ── Pass 3: LLM analyst brief (rule patterns) ─────────────────────
+    log.info("=== Pass 3: LLM analyst brief (rule patterns) ===")
     llm_brief = summarize_with_llm(
         patterns, vuln_findings, cfg, log, lookback_label=_lookback_label
     )
+
+    # ── Pass 4: LLM triage review (grouped HIGH/MEDIUM, T-1 + T-0) ───
+    log.info("=== Pass 4: LLM triage review ===")
+    summary_dir = data_dir / "output" / "triage" / "summaries"
+    triage_llm = run_triage_llm_review(entries, cfg, log, summary_dir)
+    triage_llm_brief = triage_llm.brief
 
     # ── Build report ──────────────────────────────────────────────────
     report = build_report(
@@ -179,6 +168,7 @@ def run_correlate(
         nuclei_file=nuclei_jsonl.name if nuclei_jsonl else "none",
         run_time=run_time,
         llm_brief=llm_brief,
+        triage_llm_brief=triage_llm_brief,
     )
     report_path = correlate_dir / f"report_{timestamp}.md"
     report_path.write_text(report, encoding="utf-8")
@@ -191,8 +181,17 @@ def run_correlate(
     med_count = sum(1 for p in patterns if p["confidence"] == "medium")
     changes = [f for f in vuln_findings if f["verdict_changed"]]
 
-    if high_count or med_count or changes:
-        notify_title = f"[so-ops] Correlation: {high_count} high / {med_count} medium patterns"
+    if high_count or med_count or changes or (
+        cfg.correlate.notify_on_triage_llm and triage_llm.digest_high_count > 0
+    ):
+        if high_count or med_count or changes:
+            notify_title = (
+                f"[so-ops] Correlation: {high_count} high / {med_count} medium patterns"
+            )
+        else:
+            notify_title = (
+                f"[so-ops] Triage review: {triage_llm.digest_high_count} HIGH alert groups"
+            )
 
         detail_lines: list[str] = []
         for p in patterns:
@@ -230,9 +229,14 @@ def run_correlate(
                 detail_lines.append("")
 
         detail_block = "\n".join(detail_lines).strip()
-        notify_body = (
-            (llm_brief.strip() + "\n\n---\n\n" + detail_block) if llm_brief else detail_block
-        )
+        notify_parts: list[str] = []
+        if llm_brief:
+            notify_parts.append(llm_brief.strip())
+        if triage_llm_brief:
+            notify_parts.append("---\n\nTRIAGE REVIEW (AI)\n\n" + triage_llm_brief.strip())
+        if detail_block:
+            notify_parts.append("---\n\n" + detail_block)
+        notify_body = "\n\n".join(notify_parts) if notify_parts else detail_block
         notify_all(cfg.notifications, notify_title, notify_body)
         log.info("Notification sent")
 
@@ -273,9 +277,15 @@ def run_correlate(
 
     if llm_brief:
         print("\n" + "-" * 60)
-        print("ANALYST BRIEF (AI):")
+        print("ANALYST BRIEF — RULE PATTERNS (AI):")
         print("-" * 60)
         print(llm_brief.strip())
+
+    if triage_llm_brief:
+        print("\n" + "-" * 60)
+        print("ANALYST BRIEF — TRIAGE REVIEW (AI):")
+        print("-" * 60)
+        print(triage_llm_brief.strip())
 
     print(f"\nReport: {report_path}")
     print(f"Log:    {findings_log}")

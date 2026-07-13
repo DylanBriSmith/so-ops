@@ -101,6 +101,11 @@ class NetworkConfig:
 
 
 @dataclass
+class CorrelateConfig:
+    notify_on_triage_llm: bool = False
+
+
+@dataclass
 class Config:
     elasticsearch: ESConfig
     paths: PathsConfig
@@ -109,6 +114,7 @@ class Config:
     health: HealthConfig
     vulnscan: VulnscanConfig
     network: NetworkConfig
+    correlate: CorrelateConfig = field(default_factory=CorrelateConfig)
     ollama: OllamaConfig | None = None
     openrouter: OpenRouterConfig | None = None
     llm_provider: str = "ollama"
@@ -229,6 +235,8 @@ def load_config(path: Path | None = None) -> Config:
         zones = [NetworkZone(**z) for z in zones_raw]
         network = NetworkConfig(**net_raw, zones=zones)
 
+        correlate = CorrelateConfig(**raw.get("correlate", {}))
+
     except (KeyError, TypeError) as exc:
         print(f"so-ops: config error in {path}: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -241,6 +249,7 @@ def load_config(path: Path | None = None) -> Config:
         health=health,
         vulnscan=vulnscan,
         network=network,
+        correlate=correlate,
         ollama=ollama,
         openrouter=openrouter,
         llm_provider=llm_provider,

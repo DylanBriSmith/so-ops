@@ -106,6 +106,12 @@ to_number = ""
 enabled = false
 url = ""
 
+# ── Correlate ────────────────────────────────────────────────────────────────
+
+[correlate]
+# When true, send Teams if grouped triage digest has HIGH alerts but rule patterns did not fire.
+notify_on_triage_llm = false
+
 # ── Triage ───────────────────────────────────────────────────────────────────
 
 [triage]
@@ -126,6 +132,8 @@ signatures = [
     "ET INFO Session Traversal Utilities for NAT (STUN Binding Request On Non-Standard High Port)",
     "ET INFO Microsoft Connection Test",
     "ET VOIP Multiple Unauthorized SIP Responses UDP",
+    "ET INFO Non-Anonymous LDAPv3 Bind Request Outbound",
+    "ET INFO Successful Non-Anonymous LDAPv3 Bind Request Outbound",
 ]
 
 # Signature prefixes that force a minimum severity regardless of LLM verdict.
