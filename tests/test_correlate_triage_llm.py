@@ -9,6 +9,7 @@ from so_ops.tools.correlate_triage_llm import (
     assign_window,
     build_grouped_digest,
     load_last_n_run_windows,
+    parse_triage_notify_recommendation,
 )
 
 
@@ -149,6 +150,13 @@ def test_load_last_n_run_windows_from_summaries(tmp_path):
     assert len(windows) == 2
     assert windows[0].label == "T-1"
     assert windows[1].label == "T-0"
+
+
+def test_parse_triage_notify_recommendation():
+    assert parse_triage_notify_recommendation("Summary\nNOTIFY_RECOMMENDATION: YES") is True
+    assert parse_triage_notify_recommendation("Summary\nNOTIFY_RECOMMENDATION: NO") is False
+    assert parse_triage_notify_recommendation(None) is False
+    assert parse_triage_notify_recommendation("no notify line here") is False
 
 
 def test_build_ip_map_and_scrub():

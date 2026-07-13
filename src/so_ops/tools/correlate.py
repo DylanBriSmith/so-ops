@@ -179,17 +179,21 @@ def run_correlate(
     med_count = sum(1 for p in patterns if p["confidence"] == "medium")
     changes = [f for f in vuln_findings if f["verdict_changed"]]
 
-    if high_count or med_count or changes or (
-        cfg.correlate.notify_on_triage_llm and triage_llm.digest_high_count > 0
-    ):
-        if high_count or med_count or changes:
+    pattern_notify = bool(high_count or med_count or changes)
+    triage_only_notify = (
+        cfg.correlate.notify_on_triage_llm
+        and not pattern_notify
+        and triage_llm.notify_recommended
+        and triage_llm.brief
+    )
+
+    if pattern_notify or triage_only_notify:
+        if pattern_notify:
             notify_title = (
                 f"[so-ops] Correlation: {high_count} high / {med_count} medium patterns"
             )
         else:
-            notify_title = (
-                f"[so-ops] Triage review: {triage_llm.digest_high_count} HIGH alert groups"
-            )
+            notify_title = "[so-ops] Triage review: analyst attention recommended"
 
         detail_lines: list[str] = []
         for p in patterns:

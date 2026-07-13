@@ -29,6 +29,19 @@ class TriageLlmResult:
     digest_high_count: int
     digest_medium_count: int
     digest_group_count: int
+    notify_recommended: bool = False
+
+
+def parse_triage_notify_recommendation(brief: str | None) -> bool:
+    """Return True if the triage LLM brief recommends a Teams notification."""
+    if not brief:
+        return False
+    for line in reversed(brief.strip().splitlines()):
+        upper = line.strip().upper()
+        if upper.startswith("NOTIFY_RECOMMENDATION:"):
+            value = upper.split(":", 1)[1].strip()
+            return value.startswith("YES")
+    return False
 
 
 def _parse_summary_timestamp(path: Path) -> datetime:
@@ -157,6 +170,9 @@ def summarize_triage_with_llm(
         "2. Note anything that may be a false positive (VoIP/SIP, LDAP binds, SNMP monitoring).",
         "3. Flag patterns rules might miss — especially the same scrubbed IP across both windows.",
         "4. End with a one-line overall risk level: LOW / MEDIUM / HIGH / CRITICAL.",
+        "5. End with exactly one line: NOTIFY_RECOMMENDATION: YES or NOTIFY_RECOMMENDATION: NO",
+        "   Say YES only if a human analyst should be pinged now (not for routine noise or",
+        "   expected benign traffic like VoIP, LDAP, or monitoring).",
         "",
         "Be concise and actionable. Do not repeat rule-pattern correlation output.",
         "",
@@ -202,7 +218,7 @@ def run_triage_llm_review(
     windows = load_last_n_run_windows(summary_dir, n=n_runs)
     if not windows:
         log.info("Triage LLM: no dryrun summaries found — skipping")
-        return TriageLlmResult(None, 0, 0, 0)
+        return TriageLlmResult(None, 0, 0, 0, False)
 
     llm_cutoff = windows[0].start
     log.info(
@@ -213,7 +229,7 @@ def run_triage_llm_review(
     )
     if not triage_jsonl.exists():
         log.warning("Triage LLM: no triage log at %s — skipping", triage_jsonl)
-        return TriageLlmResult(None, 0, 0, 0)
+        return TriageLlmResult(None, 0, 0, 0, False)
 
     entries, load_stats = load_triage_entries(triage_jsonl, llm_cutoff)
     log.info(
@@ -238,7 +254,7 @@ def run_triage_llm_review(
 
     if not digest:
         log.info("Triage LLM: no HIGH/MEDIUM groups in window — skipping")
-        return TriageLlmResult(None, 0, 0, 0)
+        return TriageLlmResult(None, 0, 0, 0, False)
 
     scrub = getattr(getattr(cfg, "triage", None), "scrub_ips", True)
     all_ips = collect_ips_from_entries(
@@ -247,4 +263,7 @@ def run_triage_llm_review(
     ip_map = build_ip_map(all_ips, cfg.network.internal_prefixes) if scrub else {}
 
     brief = summarize_triage_with_llm(digest, ip_map, cfg, log)
-    return TriageLlmResult(brief, high_n, med_n, len(digest))
+    notify = parse_triage_notify_recommendation(brief)
+    if brief:
+        log.info("Triage LLM notify recommendation: %s", "YES" if notify else "NO")
+    return TriageLlmResult(brief, high_n, med_n, len(digest), notify)

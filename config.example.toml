@@ -109,8 +109,9 @@ url = ""
 # ── Correlate ────────────────────────────────────────────────────────────────
 
 [correlate]
-# When true, send Teams if grouped triage digest has HIGH alerts but rule patterns did not fire.
-notify_on_triage_llm = false
+# When rule patterns are quiet, send Teams if the triage-review LLM ends with
+# NOTIFY_RECOMMENDATION: YES
+notify_on_triage_llm = true
 
 # ── Triage ───────────────────────────────────────────────────────────────────
 

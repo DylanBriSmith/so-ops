@@ -45,7 +45,7 @@ so-ops correlate --lookback-minutes 20 --skip-vuln     # 20m rule window + last-
 
 **Data sources:** correlate reads alert rows from `data_dir/logs/triage.jsonl` (deduped by `alert_id`). The two newest `dryrun_*.md` summary files are used only to mark run boundaries for Pass 4 — report markdown is not parsed.
 
-Teams notifications fire when rule patterns are HIGH/MEDIUM (Pass 4 brief is included). Optional `[correlate] notify_on_triage_llm` can alert when grouped triage has HIGH alerts but rules stayed quiet.
+Teams notifications fire when rule patterns are HIGH/MEDIUM (Pass 4 brief is included). When rules are quiet, Teams can still fire if the triage-review LLM ends with `NOTIFY_RECOMMENDATION: YES` (`[correlate] notify_on_triage_llm`, default true).
 
 See [docs/15-minute-check.md](docs/15-minute-check.md) for a plain-language walkthrough of the scheduled pipeline.
 
@@ -270,7 +270,7 @@ Configuration lives in `config.toml` (searched in CWD, then `~/.config/so-ops/`,
 | `[notifications.*]` | Email, Discord, Slack, Teams, ntfy, Gotify, SMS, webhook |
 | `[network.zones]` | Your subnet layout (helps LLM classify alerts) |
 | `[triage]` | Lookback window, auto-noise signatures, escalation rules |
-| `[correlate]` | Optional Teams notify when HIGH triage groups exist but rules are quiet |
+| `[correlate]` | Allow triage-review LLM to trigger Teams when it replies `NOTIFY_RECOMMENDATION: YES` |
 | `[vulnscan]` | Scan targets, nmap/nuclei options |
 
 See [config.example.toml](config.example.toml) for all options.

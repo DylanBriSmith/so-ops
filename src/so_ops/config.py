@@ -102,7 +102,7 @@ class NetworkConfig:
 
 @dataclass
 class CorrelateConfig:
-    notify_on_triage_llm: bool = False
+    notify_on_triage_llm: bool = True
 
 
 @dataclass
