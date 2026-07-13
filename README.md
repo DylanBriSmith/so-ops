@@ -28,7 +28,27 @@ Collects 24h metrics from Suricata, Zeek, Sigma detections, and data stream heal
 ### Vulnerability Scanning (`so-ops scan`)
 Runs nmap + vulners and/or nuclei against your network. Produces a report with CVE findings and an AI executive summary.
 
-## Where to Install
+### Alert Correlation (`so-ops correlate`)
+Reads the triage log and runs four passes:
+
+1. **Rule patterns** — 14 behavioural detectors (scan→exploit, brute force, lateral movement, inbound sweep, etc.) with no LLM
+2. **Vuln cross-reference** — optional match against recent nmap/nuclei output (`--skip-vuln` to disable)
+3. **AI pattern brief** — HIGH/MEDIUM rule findings sent to the LLM (IPs scrubbed before cloud calls)
+4. **AI triage review** — grouped HIGH/MEDIUM alerts from the **last two** `triage --dry-run` executions (T-1 + T-0), independent of the rule window
+
+Typical scheduled use (every 15 minutes):
+
+```bash
+so-ops triage --dry-run                              # rule-based triage → triage.jsonl
+so-ops correlate --lookback-minutes 20 --skip-vuln     # 20m rule window + last-two-run AI review
+```
+
+**Data sources:** correlate reads alert rows from `data_dir/logs/triage.jsonl` (deduped by `alert_id`). The two newest `dryrun_*.md` summary files are used only to mark run boundaries for Pass 4 — report markdown is not parsed.
+
+Teams notifications fire when rule patterns are HIGH/MEDIUM (Pass 4 brief is included). Optional `[correlate] notify_on_triage_llm` can alert when grouped triage has HIGH alerts but rules stayed quiet.
+
+See [docs/15-minute-check.md](docs/15-minute-check.md) for a plain-language walkthrough of the scheduled pipeline.
+
 
 so-ops does **not** need to run on your Security Onion box. It connects to SO's Elasticsearch over HTTPS, so it can run from any machine on your network that can reach the SO manager on port 9200.
 
@@ -233,6 +253,7 @@ so-ops config-check        # validate config
 so-ops test-notify         # test notification providers
 so-ops triage --dry-run    # test triage without LLM calls
 so-ops triage              # full triage run
+so-ops correlate --lookback-minutes 20 --skip-vuln   # pattern detection + AI briefs
 so-ops health              # daily health report
 so-ops scan --type nmap    # vulnerability scan
 ```
@@ -249,6 +270,7 @@ Configuration lives in `config.toml` (searched in CWD, then `~/.config/so-ops/`,
 | `[notifications.*]` | Email, Discord, Slack, Teams, ntfy, Gotify, SMS, webhook |
 | `[network.zones]` | Your subnet layout (helps LLM classify alerts) |
 | `[triage]` | Lookback window, auto-noise signatures, escalation rules |
+| `[correlate]` | Optional Teams notify when HIGH triage groups exist but rules are quiet |
 | `[vulnscan]` | Scan targets, nmap/nuclei options |
 
 See [config.example.toml](config.example.toml) for all options.
@@ -271,6 +293,7 @@ so-ops supports multiple notification providers simultaneously. Enable any combi
 `so-ops init` can generate systemd units for automated scheduling:
 
 - **Triage**: every 15 minutes
+- **Correlate**: pair with triage — `triage --dry-run` then `correlate --lookback-minutes 20 --skip-vuln` on the same interval
 - **Health**: daily at 7:10 AM
 - **Vuln scan (nmap)**: Sunday 2 AM
 - **Vuln scan (nuclei)**: Wednesday 2 AM
@@ -278,9 +301,10 @@ so-ops supports multiple notification providers simultaneously. Enable any combi
 ## How It Works
 
 1. **Elasticsearch queries** use the standard Security Onion index patterns (`logs-suricata.alerts-so`, `logs-zeek-so`, etc.) which are consistent across all SO installs
-2. **LLM classification** runs via Ollama (local, no data leaves your network) or OpenRouter (cloud, no local GPU needed)
+2. **LLM classification** runs via Ollama (local, no data leaves your network) or OpenRouter (cloud, no local GPU needed). IPs are scrubbed to `INT-001` / `EXT-001` tokens before any cloud LLM call when `scrub_ips = true`
 3. **Network zone context** from your config is injected into LLM prompts so it understands which IPs are internal vs. external
 4. **State tracking** via JSON files prevents re-processing alerts and tracks run history
+5. **Correlation** loads `triage.jsonl` with a sliding rule window (default 20 minutes), dedupes duplicate dry-run rows by `alert_id`, and runs rule patterns plus two AI passes — one on detected patterns, one on grouped triage from the last two scheduled runs
 
 ## License
 
