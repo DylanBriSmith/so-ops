@@ -21,7 +21,10 @@ from so_ops.state import ToolState
 from so_ops.tools.correlate_common import load_triage_entries
 from so_ops.tools.correlate_patterns import correlate_alert_patterns
 from so_ops.tools.correlate_report import CONSOLE_PATTERN_LABELS, build_report, summarize_with_llm
-from so_ops.tools.correlate_triage_llm import run_triage_llm_review
+from so_ops.tools.correlate_triage_llm import (
+    format_triage_digest_detail,
+    run_triage_llm_review,
+)
 from so_ops.tools.correlate_vuln import (
     correlate_vuln,
     find_latest_file,
@@ -231,6 +234,7 @@ def run_correlate(
                 detail_lines.append("")
 
         detail_block = "\n".join(detail_lines).strip()
+        triage_detail = format_triage_digest_detail(triage_llm.digest)
         notify_parts: list[str] = []
         if llm_brief:
             notify_parts.append(llm_brief.strip())
@@ -238,6 +242,8 @@ def run_correlate(
             notify_parts.append("---\n\nTRIAGE REVIEW (AI)\n\n" + triage_llm_brief.strip())
         if detail_block:
             notify_parts.append("---\n\n" + detail_block)
+        if triage_detail:
+            notify_parts.append("---\n\nTRIAGE DETAIL\n\n" + triage_detail)
         notify_body = "\n\n".join(notify_parts) if notify_parts else detail_block
         notify_all(cfg.notifications, notify_title, notify_body)
         log.info("Notification sent")

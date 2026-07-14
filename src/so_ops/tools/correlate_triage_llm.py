@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +30,7 @@ class TriageLlmResult:
     digest_medium_count: int
     digest_group_count: int
     notify_recommended: bool = False
+    digest: list[dict] = field(default_factory=list)
 
 
 def parse_triage_notify_recommendation(brief: str | None) -> bool:
@@ -42,6 +43,39 @@ def parse_triage_notify_recommendation(brief: str | None) -> bool:
             value = upper.split(":", 1)[1].strip()
             return value.startswith("YES")
     return False
+
+
+def format_triage_digest_detail(digest: list[dict], max_groups: int = 20) -> str:
+    """Format grouped digest rows with real IPs for Teams / report detail."""
+    if not digest:
+        return ""
+
+    lines: list[str] = []
+    shown = digest[:max_groups]
+    for g in shown:
+        t_first = str(g.get("time_first", ""))[:16]
+        t_last = str(g.get("time_last", ""))[:16]
+        lines.append(
+            f"[{g.get('verdict', '?')}] {g.get('window', '?')}"
+            f" | {g.get('alert_count', 0)} alerts"
+            f" | {t_first} - {t_last}"
+        )
+        lines.append(
+            f"  {g.get('source_ip', '?')} -> {g.get('dest_ip', '?')}:{g.get('dest_port', '?')}"
+        )
+        rule = g.get("rule_name", "")
+        if rule:
+            lines.append(f"  Rule: {rule}")
+        reason = g.get("reason", "")
+        if reason:
+            lines.append(f"  Reason: {reason}")
+        lines.append("")
+
+    remaining = len(digest) - len(shown)
+    if remaining > 0:
+        lines.append(f"...({remaining} more groups)")
+
+    return "\n".join(lines).strip()
 
 
 def _parse_summary_timestamp(path: Path) -> datetime:
@@ -163,18 +197,38 @@ def summarize_triage_with_llm(
     lines = [
         "You are a Security Operations Center analyst reviewing automated alert triage output.",
         "Below are grouped HIGH and MEDIUM alerts from two consecutive 15-minute triage windows.",
-        "Window T-1 is the previous scheduled run; T-0 is the current run. IPs are scrubbed.",
+        "Window T-1 is the previous scheduled run; T-0 is the current run. IPs are scrubbed",
+        "(INT-### / EXT-###). Prefer depth and analyst usefulness over brevity — no fluff.",
         "",
-        "Your tasks:",
-        "1. Summarize what network activity is happening and whether it looks coordinated.",
-        "2. Note anything that may be a false positive (VoIP/SIP, LDAP binds, SNMP monitoring).",
-        "3. Flag patterns rules might miss — especially the same scrubbed IP across both windows.",
-        "4. End with a one-line overall risk level: LOW / MEDIUM / HIGH / CRITICAL.",
-        "5. End with exactly one line: NOTIFY_RECOMMENDATION: YES or NOTIFY_RECOMMENDATION: NO",
+        "Write a structured brief with these sections:",
+        "",
+        "1. What happened",
+        "   3–6 sentences on the main activity: who → whom, ports, rules, and volumes.",
+        "   Explicitly compare T-1 vs T-0 (new activity, continuing, escalating, or quiet).",
+        "",
+        "2. Notable hosts",
+        "   Call out the most important scrubbed IPs and why they matter (repeat across",
+        "   windows, many targets, attack-category rules, high alert counts).",
+        "",
+        "3. Likely false positives",
+        "   Note VoIP/SIP, LDAP binds, SNMP/monitoring, reputation blocklists, or other",
+        "   expected noise. Say 'None apparent' only if that is truly the case.",
+        "",
+        "4. What an analyst should do next",
+        "   2–4 concrete steps (e.g. SO Hunt by community_id / 5-tuple, verify host role,",
+        "   check firewall blocks, compare to baseline).",
+        "",
+        "5. Overall risk — one line ending with: LOW / MEDIUM / HIGH / CRITICAL",
+        "",
+        "6. Notify — end with exactly one line:",
+        "   NOTIFY_RECOMMENDATION: YES",
+        "   or",
+        "   NOTIFY_RECOMMENDATION: NO",
         "   Say YES only if a human analyst should be pinged now (not for routine noise or",
-        "   expected benign traffic like VoIP, LDAP, or monitoring).",
+        "   expected benign traffic).",
         "",
-        "Be concise and actionable. Do not repeat rule-pattern correlation output.",
+        "Do not invent IPs or rules not present in the groups. Do not repeat rule-pattern",
+        "correlation engine output — this is independent triage analysis.",
         "",
         "--- TRIAGE GROUPS ---",
         "",
@@ -215,10 +269,11 @@ def run_triage_llm_review(
     n_runs: int = 2,
 ) -> TriageLlmResult:
     """Pass 4: group HIGH/MEDIUM triage from the last n dry-runs and call LLM."""
+    empty = TriageLlmResult(None, 0, 0, 0, False, [])
     windows = load_last_n_run_windows(summary_dir, n=n_runs)
     if not windows:
         log.info("Triage LLM: no dryrun summaries found — skipping")
-        return TriageLlmResult(None, 0, 0, 0, False)
+        return empty
 
     llm_cutoff = windows[0].start
     log.info(
@@ -229,7 +284,7 @@ def run_triage_llm_review(
     )
     if not triage_jsonl.exists():
         log.warning("Triage LLM: no triage log at %s — skipping", triage_jsonl)
-        return TriageLlmResult(None, 0, 0, 0, False)
+        return empty
 
     entries, load_stats = load_triage_entries(triage_jsonl, llm_cutoff)
     log.info(
@@ -254,7 +309,7 @@ def run_triage_llm_review(
 
     if not digest:
         log.info("Triage LLM: no HIGH/MEDIUM groups in window — skipping")
-        return TriageLlmResult(None, 0, 0, 0, False)
+        return empty
 
     scrub = getattr(getattr(cfg, "triage", None), "scrub_ips", True)
     all_ips = collect_ips_from_entries(
@@ -266,4 +321,4 @@ def run_triage_llm_review(
     notify = parse_triage_notify_recommendation(brief)
     if brief:
         log.info("Triage LLM notify recommendation: %s", "YES" if notify else "NO")
-    return TriageLlmResult(brief, high_n, med_n, len(digest), notify)
+    return TriageLlmResult(brief, high_n, med_n, len(digest), notify, digest)

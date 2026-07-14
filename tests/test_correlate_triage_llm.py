@@ -8,6 +8,7 @@ from so_ops.tools.correlate_triage_llm import (
     RunWindow,
     assign_window,
     build_grouped_digest,
+    format_triage_digest_detail,
     load_last_n_run_windows,
     parse_triage_notify_recommendation,
 )
@@ -157,6 +158,51 @@ def test_parse_triage_notify_recommendation():
     assert parse_triage_notify_recommendation("Summary\nNOTIFY_RECOMMENDATION: NO") is False
     assert parse_triage_notify_recommendation(None) is False
     assert parse_triage_notify_recommendation("no notify line here") is False
+
+
+def test_format_triage_digest_detail_includes_real_ips_and_fields():
+    digest = [
+        {
+            "window": "T-0",
+            "verdict": "MEDIUM",
+            "alert_count": 12,
+            "time_first": "2026-07-14T12:01:00+00:00",
+            "time_last": "2026-07-14T12:08:00+00:00",
+            "source_ip": "94.26.105.226",
+            "dest_ip": "192.168.1.10",
+            "dest_port": 443,
+            "rule_name": "ET SCAN MS Terminal Server Traffic on Non-standard Port",
+            "reason": "external scan activity",
+        }
+    ]
+    text = format_triage_digest_detail(digest)
+    assert "[MEDIUM] T-0 | 12 alerts |" in text
+    assert "94.26.105.226 -> 192.168.1.10:443" in text
+    assert "Rule: ET SCAN MS Terminal Server Traffic on Non-standard Port" in text
+    assert "Reason: external scan activity" in text
+
+
+def test_format_triage_digest_detail_truncates():
+    digest = [
+        {
+            "window": "T-0",
+            "verdict": "MEDIUM",
+            "alert_count": i,
+            "time_first": "2026-07-14T12:00:00+00:00",
+            "time_last": "2026-07-14T12:01:00+00:00",
+            "source_ip": f"10.0.0.{i}",
+            "dest_ip": "192.168.1.10",
+            "dest_port": 443,
+            "rule_name": "ET SCAN Test",
+            "reason": "test",
+        }
+        for i in range(1, 26)
+    ]
+    text = format_triage_digest_detail(digest, max_groups=20)
+    assert "...(5 more groups)" in text
+    assert "10.0.0.1 ->" in text
+    assert "10.0.0.20 ->" in text
+    assert "10.0.0.21 ->" not in text
 
 
 def test_build_ip_map_and_scrub():
