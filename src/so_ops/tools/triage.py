@@ -118,6 +118,8 @@ def _extract_alert_summary(hit: dict) -> dict:
         "community_id": src.get("network", {}).get("community_id", ""),
         "ruleset": rule.get("ruleset", ""),
         "action": rule.get("action", alert_info.get("action", "")),
+        "source_org": source.get("as", {}).get("organization", {}).get("name", ""),
+        "source_location": source.get("geo", {}).get("country_name", ""),
     }
 
 
@@ -395,6 +397,8 @@ def _log_triage_result(alert: dict, verdict_info: dict, jsonl_path: Path) -> dic
         "reason": verdict_info.get("reason", alert.get("triage_reason", "")),
         "recommendation": verdict_info.get("recommendation", ""),
         "method": verdict_info.get("method", alert.get("triage_method", "llm")),
+        "source_org": alert.get("source_org", ""),
+        "source_location": alert.get("source_location", ""),
     }
     with open(jsonl_path, "a") as f:
         f.write(json.dumps(entry) + "\n")

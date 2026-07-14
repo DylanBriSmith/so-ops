@@ -173,13 +173,32 @@ def test_format_triage_digest_detail_includes_real_ips_and_fields():
             "dest_port": 443,
             "rule_name": "ET SCAN MS Terminal Server Traffic on Non-standard Port",
             "reason": "external scan activity",
+            "source_org": "Fastly, Inc.",
+            "source_location": "United States",
         }
     ]
     text = format_triage_digest_detail(digest)
     assert "[MEDIUM] T-0 | 12 alerts |" in text
     assert "94.26.105.226 -> 192.168.1.10:443" in text
+    assert "Org: Fastly, Inc. / United States" in text
     assert "Rule: ET SCAN MS Terminal Server Traffic on Non-standard Port" in text
     assert "Reason: external scan activity" in text
+
+
+def test_build_grouped_digest_keeps_source_org():
+    windows = [
+        RunWindow(
+            label="T-0",
+            start=datetime(2026, 7, 10, 14, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 10, 14, 30, tzinfo=timezone.utc),
+        )
+    ]
+    e = _entry("1", "MEDIUM", "2026-07-10T14:05:00+00:00")
+    e["source_org"] = "Hurricane Electric LLC"
+    e["source_location"] = "United States"
+    digest = build_grouped_digest([e], windows)
+    assert digest[0]["source_org"] == "Hurricane Electric LLC"
+    assert digest[0]["source_location"] == "United States"
 
 
 def test_format_triage_digest_detail_truncates():

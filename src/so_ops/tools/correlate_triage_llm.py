@@ -63,6 +63,11 @@ def format_triage_digest_detail(digest: list[dict], max_groups: int = 20) -> str
         lines.append(
             f"  {g.get('source_ip', '?')} -> {g.get('dest_ip', '?')}:{g.get('dest_port', '?')}"
         )
+        org = g.get("source_org") or ""
+        loc = g.get("source_location") or ""
+        if org or loc:
+            org_bits = [b for b in (org, loc) if b]
+            lines.append(f"  Org: {' / '.join(org_bits)}")
         rule = g.get("rule_name", "")
         if rule:
             lines.append(f"  Rule: {rule}")
@@ -158,6 +163,8 @@ def build_grouped_digest(
                 "dest_port": e.get("dest_port", "?"),
                 "verdict": verdict,
                 "reason": e.get("reason", ""),
+                "source_org": e.get("source_org", "") or "",
+                "source_location": e.get("source_location", "") or "",
                 "alert_count": 1,
                 "time_first": e.get("alert_timestamp", ""),
                 "time_last": e.get("alert_timestamp", ""),
@@ -166,6 +173,10 @@ def build_grouped_digest(
             continue
 
         g["alert_count"] += 1
+        if not g.get("source_org") and e.get("source_org"):
+            g["source_org"] = e["source_org"]
+        if not g.get("source_location") and e.get("source_location"):
+            g["source_location"] = e["source_location"]
         ats = e.get("alert_timestamp", "")
         if ats and ats < g["time_first"]:
             g["time_first"] = ats
@@ -209,10 +220,13 @@ def summarize_triage_with_llm(
         "2. Notable hosts",
         "   Call out the most important scrubbed IPs and why they matter (repeat across",
         "   windows, many targets, attack-category rules, high alert counts).",
+        "   Use source org/location when present (e.g. Fastly, Cloudflare, ISP names) to",
+        "   judge CDN vs hostile hosting.",
         "",
         "3. Likely false positives",
-        "   Note VoIP/SIP, LDAP binds, SNMP/monitoring, reputation blocklists, or other",
-        "   expected noise. Say 'None apparent' only if that is truly the case.",
+        "   Note VoIP/SIP, LDAP binds, SNMP/monitoring, reputation blocklists, CDN/edge",
+        "   traffic, or other expected noise. Say 'None apparent' only if that is truly",
+        "   the case.",
         "",
         "4. What an analyst should do next",
         "   2–4 concrete steps (e.g. SO Hunt by community_id / 5-tuple, verify host role,",
@@ -242,6 +256,11 @@ def summarize_triage_with_llm(
             f"  {src} -> {dst}:{g['dest_port']} | count={g['alert_count']}"
             f" | {g['time_first'][:16]} to {g['time_last'][:16]}"
         )
+        org = g.get("source_org") or ""
+        loc = g.get("source_location") or ""
+        if org or loc:
+            org_bits = [b for b in (org, loc) if b]
+            lines.append(f"  Org: {' / '.join(org_bits)}")
         if g.get("reason"):
             lines.append(f"  Reason: {scrub_text(g['reason'], ip_map)}")
         if g.get("community_ids"):
