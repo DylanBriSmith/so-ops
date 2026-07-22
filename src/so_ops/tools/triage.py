@@ -575,7 +575,8 @@ def run_triage(cfg: Config, dry_run: bool = False):
     default_since = (
         datetime.now(timezone.utc) - timedelta(hours=cfg.triage.lookback_hours)
     ).isoformat()
-    since = state.get_cursor("last_timestamp", default_since)
+    cursor_key = "last_timestamp_dry_run" if dry_run else "last_timestamp"
+    since = state.get_cursor(cursor_key, default_since)
     log.info("=" * 60)
     log.info("SO Alert Triage starting (dry_run=%s)", dry_run)
     log.info("Processing alerts since: %s", since)
@@ -596,7 +597,7 @@ def run_triage(cfg: Config, dry_run: bool = False):
         # Fetch detection alerts only on first iteration
         if not all_detection_alerts:
             all_detection_alerts = es.fetch_detection_alerts(
-                state.get_cursor("last_timestamp", default_since),
+                state.get_cursor(cursor_key, default_since),
                 index=indices.detections,
             )
             if all_detection_alerts:
@@ -717,10 +718,11 @@ def run_triage(cfg: Config, dry_run: bool = False):
                     entry = _log_triage_result(alert, verdict_info, jsonl_path)
                     all_results.append(entry)
 
-        # Update cursor only on live runs so dry run can be repeated
+        # Dry run advances its own cursor key so the scheduled --dry-run job
+        # doesn't re-fetch/re-log the full lookback window every run, while
+        # a manual live triage run keeps its separate cursor untouched.
         since = hits[-1]["_source"]["@timestamp"]
-        if not dry_run:
-            state.set_cursor("last_timestamp", since)
+        state.set_cursor(cursor_key, since)
 
         if len(hits) < cfg.triage.max_alerts_per_query:
             break

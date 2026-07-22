@@ -245,8 +245,29 @@ def run_correlate(
         if triage_detail:
             notify_parts.append("---\n\nTRIAGE DETAIL\n\n" + triage_detail)
         notify_body = "\n\n".join(notify_parts) if notify_parts else detail_block
-        notify_all(cfg.notifications, notify_title, notify_body)
-        log.info("Notification sent")
+        notify_results = notify_all(cfg.notifications, notify_title, notify_body)
+
+        failed = [name for name, ok in notify_results.items() if not ok]
+        if failed:
+            log.error("Notification FAILED for provider(s): %s", ", ".join(failed))
+        succeeded = [name for name, ok in notify_results.items() if ok]
+        if succeeded:
+            log.info("Notification sent via: %s", ", ".join(succeeded))
+        if not notify_results:
+            log.warning("Notification not sent — no providers enabled")
+
+        notify_log_path = log_dir / "correlate_notifications.jsonl"
+        with open(notify_log_path, "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "sent_at": datetime.now(timezone.utc).isoformat(),
+                        "subject": notify_title,
+                        "providers": notify_results,
+                    }
+                )
+                + "\n"
+            )
 
     # ── Console summary ───────────────────────────────────────────────
     high_p = [p for p in patterns if p["confidence"] == "high"]
