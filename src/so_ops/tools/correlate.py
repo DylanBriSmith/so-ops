@@ -198,10 +198,23 @@ def run_correlate(
         else:
             notify_title = "[so-ops] Triage review: analyst attention recommended"
 
+        # Teams/Power Automate silently drops oversized Adaptive Card payloads
+        # (our HTTP call still returns success, so this failure is invisible
+        # unless we cap the body ourselves). Only show the top N patterns by
+        # severity/volume; point to the full report on disk for the rest.
+        MAX_NOTIFY_PATTERNS = 12
+        MAX_NOTIFY_CHARS = 6000
+
+        confidence_rank = {"high": 0, "medium": 1, "low": 2}
+        hm_patterns = [p for p in patterns if p["confidence"] in ("high", "medium")]
+        hm_patterns.sort(
+            key=lambda p: (confidence_rank.get(p["confidence"], 9), -p.get("alert_count", 0))
+        )
+        shown_patterns = hm_patterns[:MAX_NOTIFY_PATTERNS]
+        omitted_count = len(hm_patterns) - len(shown_patterns)
+
         detail_lines: list[str] = []
-        for p in patterns:
-            if p["confidence"] not in ("high", "medium"):
-                continue
+        for p in shown_patterns:
             detail_lines.append(
                 f"[{p['confidence'].upper()}] {p['pattern_type'].upper()}"
                 f" | {p['alert_count']} alerts"
@@ -220,6 +233,12 @@ def run_correlate(
             detail_lines.append(f"  Reason: {p.get('reason', '')}")
             detail_lines.append("")
 
+        if omitted_count > 0:
+            detail_lines.append(
+                f"...and {omitted_count} more pattern(s) — see full report: {report_path}"
+            )
+            detail_lines.append("")
+
         if changes:
             detail_lines.append("VERDICT UPGRADES FROM VULN CORRELATION:")
             for f in changes:
@@ -234,7 +253,7 @@ def run_correlate(
                 detail_lines.append("")
 
         detail_block = "\n".join(detail_lines).strip()
-        triage_detail = format_triage_digest_detail(triage_llm.digest)
+        triage_detail = format_triage_digest_detail(triage_llm.digest, max_groups=8)
         notify_parts: list[str] = []
         if llm_brief:
             notify_parts.append(llm_brief.strip())
@@ -245,6 +264,17 @@ def run_correlate(
         if triage_detail:
             notify_parts.append("---\n\nTRIAGE DETAIL\n\n" + triage_detail)
         notify_body = "\n\n".join(notify_parts) if notify_parts else detail_block
+
+        # Hard safety net: even with the caps above, LLM briefs alone could
+        # still push this over Teams' payload limit (Teams/Power Automate
+        # accepts the HTTP call but silently drops oversized cards, so a
+        # truncation failure here would otherwise be invisible).
+        if len(notify_body) > MAX_NOTIFY_CHARS:
+            notify_body = (
+                notify_body[:MAX_NOTIFY_CHARS].rstrip()
+                + f"\n\n...[truncated — full report: {report_path}]"
+            )
+
         notify_results = notify_all(cfg.notifications, notify_title, notify_body)
 
         failed = [name for name, ok in notify_results.items() if not ok]
