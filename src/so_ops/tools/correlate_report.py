@@ -11,6 +11,7 @@ from so_ops.tools.correlate_ip import (
     collect_ips_from_vuln_findings,
     scrub_text,
 )
+from so_ops.tools.correlate_triage_llm import format_triage_digest_detail
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
@@ -47,6 +48,7 @@ def build_report(
     run_time: str,
     llm_brief: str | None = None,
     triage_llm_brief: str | None = None,
+    triage_digest: list[dict] | None = None,
 ) -> str:
     high_p = [p for p in patterns if p["confidence"] == "high"]
     med_p = [p for p in patterns if p["confidence"] == "medium"]
@@ -82,6 +84,27 @@ def build_report(
             triage_llm_brief.strip(),
             "",
         ]
+
+        # Full, untruncated, real-IP digest so every [G#] the AI brief cites
+        # (e.g. "G13, G30") can be traced back to an actual alert group.
+        # Teams gets a capped version of this same list for size reasons —
+        # this report is the one place the whole thing lives.
+        digest_detail = format_triage_digest_detail(triage_digest or [], max_groups=None)
+        if digest_detail:
+            lines += [
+                "---",
+                "# Triage Review Digest (full, real IPs)",
+                "",
+                "Reference key for the [G#] group numbers cited in the Triage",
+                "Review brief above. Each row is one group of identical",
+                "alerts (same rule + src/dest IP/port + verdict) from the",
+                "current and previous triage windows.",
+                "",
+                "```",
+                digest_detail,
+                "```",
+                "",
+            ]
 
     lines += [
         "## Summary",

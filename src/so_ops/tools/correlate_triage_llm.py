@@ -45,18 +45,26 @@ def parse_triage_notify_recommendation(brief: str | None) -> bool:
     return False
 
 
-def format_triage_digest_detail(digest: list[dict], max_groups: int = 20) -> str:
-    """Format grouped digest rows with real IPs for Teams / report detail."""
+def format_triage_digest_detail(digest: list[dict], max_groups: int | None = None) -> str:
+    """Format grouped digest rows with real IPs for Teams / report detail.
+
+    Each row is labelled [G#] using the same 1-based index the AI brief cites
+    in `summarize_triage_with_llm` (which enumerates this same `digest` list),
+    so a reader can trace a citation like "(G13, G30)" back to a real row.
+    Pass max_groups=None (default) for the full, untruncated digest — used in
+    the saved report. Teams callers pass a small max_groups to stay within
+    payload limits.
+    """
     if not digest:
         return ""
 
     lines: list[str] = []
-    shown = digest[:max_groups]
-    for g in shown:
+    shown = digest if max_groups is None else digest[:max_groups]
+    for i, g in enumerate(shown, 1):
         t_first = str(g.get("time_first", ""))[:16]
         t_last = str(g.get("time_last", ""))[:16]
         lines.append(
-            f"[{g.get('verdict', '?')}] {g.get('window', '?')}"
+            f"[G{i}] [{g.get('verdict', '?')}] {g.get('window', '?')}"
             f" | {g.get('alert_count', 0)} alerts"
             f" | {t_first} - {t_last}"
         )

@@ -184,6 +184,7 @@ def run_correlate(
         run_time=run_time,
         llm_brief=llm_brief,
         triage_llm_brief=triage_llm_brief,
+        triage_digest=triage_llm.digest,
     )
     report_path = correlate_dir / f"report_{timestamp}.md"
     report_path.write_text(report, encoding="utf-8")
@@ -203,6 +204,11 @@ def run_correlate(
         and triage_llm.notify_recommended
         and triage_llm.brief
     )
+
+    # Recorded for the "## Notification" section appended to the report below
+    # so a reader can see, at a glance, whether/why/where this run notified —
+    # without cross-referencing correlate_notifications.jsonl separately.
+    notification_status = "Not sent — no HIGH/MEDIUM patterns and no AI notify recommendation."
 
     if pattern_notify or triage_only_notify:
         if pattern_notify:
@@ -300,6 +306,28 @@ def run_correlate(
         if not notify_results:
             log.warning("Notification not sent — no providers enabled")
 
+        trigger_reason = (
+            f"{high_count} high / {med_count} medium pattern(s)"
+            if pattern_notify
+            else "AI triage review recommended notifying (no rule patterns fired)"
+        )
+        if succeeded and not failed:
+            notification_status = f"Sent via: {', '.join(succeeded)}. Trigger: {trigger_reason}."
+        elif succeeded and failed:
+            notification_status = (
+                f"Sent via: {', '.join(succeeded)}. FAILED via: {', '.join(failed)}."
+                f" Trigger: {trigger_reason}."
+            )
+        elif failed:
+            notification_status = (
+                f"FAILED for all provider(s): {', '.join(failed)}. Trigger: {trigger_reason}."
+            )
+        else:
+            notification_status = (
+                f"Not sent — no notification providers enabled. Trigger would have been:"
+                f" {trigger_reason}."
+            )
+
         notify_log_path = log_dir / "correlate_notifications.jsonl"
         with open(notify_log_path, "a") as f:
             f.write(
@@ -312,6 +340,9 @@ def run_correlate(
                 )
                 + "\n"
             )
+
+    with open(report_path, "a", encoding="utf-8") as f:
+        f.write("\n---\n\n# Notification\n\n" + notification_status + "\n")
 
     # ── Console summary ───────────────────────────────────────────────
     high_p = [p for p in patterns if p["confidence"] == "high"]
