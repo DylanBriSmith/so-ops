@@ -103,6 +103,10 @@ class NetworkConfig:
 @dataclass
 class CorrelateConfig:
     notify_on_triage_llm: bool = True
+    # Source IPs excluded from Pass 1 rule-based pattern detection — for hosts
+    # that are known-benign but trip patterns like high_volume_src/port_sweep
+    # on every run (e.g. a busy DNS client), causing repeat Teams noise.
+    exclude_source_ips: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -90,9 +90,23 @@ def run_correlate(
         print(f"No triage alerts in rule window ({_lookback_label}). Pass 4 may still run.")
 
     # ── Pass 1: alert × alert patterns ───────────────────────────────
-    log.info("=== Pass 1: alert pattern detection (%d alerts) ===", len(entries))
+    exclude_ips = set(cfg.correlate.exclude_source_ips)
+    pattern_entries = (
+        [e for e in entries if e.get("source_ip") not in exclude_ips] if exclude_ips else entries
+    )
+    if exclude_ips:
+        log.info(
+            "Pattern detection: excluding %d source IP(s) (%d of %d alerts dropped)",
+            len(exclude_ips),
+            len(entries) - len(pattern_entries),
+            len(entries),
+        )
+    log.info("=== Pass 1: alert pattern detection (%d alerts) ===", len(pattern_entries))
     patterns = correlate_alert_patterns(
-        entries, cfg.network.internal_prefixes, log, window_minutes=_lookback.total_seconds() / 60
+        pattern_entries,
+        cfg.network.internal_prefixes,
+        log,
+        window_minutes=_lookback.total_seconds() / 60,
     )
     log.info(
         "Patterns: %d total (%d high, %d medium, %d low)",

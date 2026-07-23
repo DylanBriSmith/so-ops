@@ -113,6 +113,11 @@ url = ""
 # NOTIFY_RECOMMENDATION: YES
 notify_on_triage_llm = true
 
+# Source IPs to skip in Pass 1 rule-based pattern detection (e.g. a known-benign
+# busy host that trips high_volume_src/port_sweep on nearly every run). Still
+# visible to the Pass 4 AI triage review — this only quiets the rule engine.
+exclude_source_ips = []
+
 # ── Triage ───────────────────────────────────────────────────────────────────
 
 [triage]
