@@ -37,6 +37,16 @@ _PIVOT_PORT_ALERT_MIN = 5  # min alerts for dest_port_pivot
 _AUTH_PORTS = {21, 22, 23, 110, 143, 389, 445, 1433, 3306, 3389, 5432, 5900, 5984, 5985, 5986}
 
 
+def _port_int(value) -> int:
+    """Coerce a dest_port value to int, treating non-numeric placeholders
+    (e.g. "?" for portless protocols like ICMP) as 0 instead of raising.
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _build_pattern(
     pattern_type: str,
     confidence: str,
@@ -468,7 +478,7 @@ def correlate_alert_patterns(
 
     # ── Pattern 9: brute force — repeated alerts on auth ports same pair ──
     for (src_ip, dest_ip), pair_entries in by_pair.items():
-        auth_entries = [e for e in pair_entries if int(e.get("dest_port", 0) or 0) in _AUTH_PORTS]
+        auth_entries = [e for e in pair_entries if _port_int(e.get("dest_port")) in _AUTH_PORTS]
         if len(auth_entries) < _BRUTE_FORCE_MIN:
             continue
 
